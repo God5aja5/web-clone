@@ -1,7 +1,13 @@
 #!/usr/bin/env python3
 """
 Ghost Advance — Playwright Website Cloner (single-file, Render-friendly)
-Fixed quoting/regex issues.
+Improvements included:
+ - Robust Playwright/browser install check
+ - Safer regexes for rewriting src/href/action/poster attributes
+ - Safer url(...) CSS replacement
+ - Better mapping of saved resources to absolute URLs
+ - Compatible send_file zipper download name fallback
+Save as ghost_advance.py and run (see instructions at bottom).
 """
 import os
 import re
@@ -19,13 +25,12 @@ import shutil
 import uuid
 import subprocess
 from urllib.parse import urlparse, urljoin, unquote, urldefrag
-from collections import deque
 import queue
 import urllib.robotparser
 
 from flask import Flask, request, jsonify, send_file, render_template_string, abort
 
-# Playwright import
+# Playwright import (lazy)
 try:
     from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
 except Exception:
@@ -74,7 +79,8 @@ def ensure_parent(path: str):
 def ext_from_content_type(ct: str):
     if not ct:
         return ''
-    return mimetypes.guess_extension(ct.split(';', 1)[0].strip() or '') or ''
+    ext = mimetypes.guess_extension(ct.split(';', 1)[0].strip() or '')
+    return ext or ''
 
 def normalize_url(base: str, link: str):
     if not link:
@@ -133,7 +139,7 @@ def worker_func(jobid, url_queue, visited_set, visited_lock, job_opts, tmpdir, s
                 browser = p.chromium.launch(headless=True)
             desktop_ctx = browser.new_context(ignore_https_errors=True)
             try:
-                mobile_ctx = browser.new_context(ignore_https_errors=True, **mobile_device)
+                mobile_ctx = browser.new_context(ignore_https_errors=True, **(mobile_device or {}))
             except Exception:
                 mobile_ctx = browser.new_context(ignore_https_errors=True)
             try:
@@ -152,13 +158,13 @@ def worker_func(jobid, url_queue, visited_set, visited_lock, job_opts, tmpdir, s
                     break
 
                 # runtime/resource caps
-                if job_opts['max_runtime'] and job_opts['max_runtime'] > 0:
+                if job_opts.get('max_runtime') and job_opts['max_runtime'] > 0:
                     if time.time() - job_opts['job_start_time'] > job_opts['max_runtime']:
                         with JOBS_LOCK:
                             job_ref['logs'].append("Worker: job max runtime reached.")
                         url_queue.task_done()
                         break
-                if job_opts['max_resources'] and job_opts['max_resources'] > 0 and job_ref.get('saved_count',0) >= job_opts['max_resources']:
+                if job_opts.get('max_resources') and job_opts['max_resources'] > 0 and job_ref.get('saved_count',0) >= job_opts['max_resources']:
                     with JOBS_LOCK:
                         job_ref['logs'].append("Worker: resource cap reached.")
                     url_queue.task_done()
@@ -199,7 +205,7 @@ def worker_func(jobid, url_queue, visited_set, visited_lock, job_opts, tmpdir, s
                                 body = resp.body()
                             except Exception:
                                 return
-                            if not body:
+                            if body is None:
                                 return
                             headers = resp.headers or {}
                             local = make_local_path(tmpdir, rurl, snapshot_idx=snapshot_idx, subfolder='assets')
@@ -236,7 +242,7 @@ def worker_func(jobid, url_queue, visited_set, visited_lock, job_opts, tmpdir, s
                     page.on("request", handle_req)
 
                     try:
-                        page.goto(cur, timeout=job_opts['per_page_timeout']*1000, wait_until="domcontentloaded")
+                        page.goto(cur, timeout=max(1, int(job_opts.get('per_page_timeout',30)))*1000, wait_until="domcontentloaded")
                     except PlaywrightTimeout:
                         with JOBS_LOCK:
                             job_ref['logs'].append(f"[{label}] timeout loading {cur}")
@@ -249,7 +255,7 @@ def worker_func(jobid, url_queue, visited_set, visited_lock, job_opts, tmpdir, s
                     except Exception:
                         pass
 
-                    if job_opts['follow_buttons']:
+                    if job_opts.get('follow_buttons'):
                         try:
                             elems = page.query_selector_all('button[data-href], [role="link"][data-href], a[data-auto-click]')
                             for e in elems[:5]:
@@ -288,7 +294,7 @@ def worker_func(jobid, url_queue, visited_set, visited_lock, job_opts, tmpdir, s
                         with JOBS_LOCK:
                             job_ref['logs'].append(f"[{label}] html save warn: {e}")
 
-                    if job_opts['auto_snapshot']:
+                    if job_opts.get('auto_snapshot'):
                         try:
                             shot_name = os.path.join(tmpdir, f"screenshot_snapshot_{snapshot_idx}_{label}.png")
                             page.screenshot(path=shot_name, full_page=False)
@@ -321,7 +327,7 @@ def worker_func(jobid, url_queue, visited_set, visited_lock, job_opts, tmpdir, s
                             continue
                         n = normalize_url(cur, L)
                         if n and n.startswith('http'):
-                            if job_opts['same_host_only'] and not same_host(job_opts['start_url'], n):
+                            if job_opts.get('same_host_only') and not same_host(job_opts['start_url'], n):
                                 continue
                             discovered_links.add(n)
 
@@ -342,10 +348,10 @@ def worker_func(jobid, url_queue, visited_set, visited_lock, job_opts, tmpdir, s
                     for st in (data.get('scripts') or []):
                         if not st:
                             continue
-                        # fixed regex for absolute URLs in script text
-                        for m in re.finditer(r'(https?://[\w\-\./:?&=#%]+)', st):
+                        # absolute URLs in script text
+                        for m in re.finditer(r'(https?://[^\s"\'<>]+)', st):
                             discovered_endpoints.add(m.group(1))
-                        # fixed regex for api-like relative paths quoted in scripts
+                        # api-like relative paths quoted in scripts
                         for m in re.finditer(r'(["\'])(/[^"\']*?/api/[^"\']*)(["\'])', st, flags=re.I):
                             candidate = m.group(2)
                             candidate_abs = normalize_url(cur, candidate)
@@ -358,7 +364,7 @@ def worker_func(jobid, url_queue, visited_set, visited_lock, job_opts, tmpdir, s
                         for n in discovered_links:
                             if n in visited_set:
                                 continue
-                            if job_opts['depth_limit'] and job_opts['depth_limit'] > 0 and depth+1 > job_opts['depth_limit']:
+                            if job_opts.get('depth_limit') and job_opts['depth_limit'] > 0 and depth+1 > job_opts['depth_limit']:
                                 continue
                             visited_set.add(n)
                             try:
@@ -410,8 +416,9 @@ def run_mirror_job(jobid: str, start_url: str):
         job['finished_at'] = time.time()
         return
 
-    advanced = job.get('advanced', True)
-    obey_robots = job.get('obey_robots', False)
+    # options
+    advanced = bool(job.get('advanced', True))
+    obey_robots = bool(job.get('obey_robots', False))
     concurrency = max(1, int(job.get('concurrency', 1) or 1))
     crawl_mode = job.get('crawl_mode', 'bfs')
     depth_limit = int(job.get('depth_limit', 0) or 0)
@@ -517,23 +524,38 @@ def run_mirror_job(jobid: str, start_url: str):
 
             job['logs'].append(f"Snapshot {sidx+1} finished. Saved: {job.get('saved_count',0)}")
 
+        # Build url_to_local mapping from saved resources (already populated),
+        # and add fallback mappings for HTML files saved directly.
         job['logs'].append("Rewriting HTML to point to local assets where possible...")
         url_to_local = job.get('url_to_local', {}) or {}
+
+        # Walk saved files to add additional mappings for HTML & assets
         for root_dir, _, files in os.walk(tmpdir):
             for fn in files:
                 full = os.path.join(root_dir, fn)
                 rel = os.path.relpath(full, tmpdir).replace(os.sep, '/')
-                parts = rel.split('/', 2)
+                parts = rel.split('/')
+                # expected: snapshot_<n>/netloc/...
                 if len(parts) >= 3 and parts[0].startswith('snapshot_'):
-                    _, netloc, rest = parts[0], parts[1], parts[2]
-                    possible_url = f"https://{netloc}/{rest}"
-                    url_to_local.setdefault(possible_url, rel)
-                    url_to_local.setdefault(f"http://{netloc}/{rest}", rel)
+                    netloc = parts[1]
+                    rest = '/'.join(parts[2:])
+                    possible_https = f"https://{netloc}/{rest}"
+                    possible_http = f"http://{netloc}/{rest}"
+                    url_to_local.setdefault(possible_https, rel)
+                    url_to_local.setdefault(possible_http, rel)
                 elif len(parts) >= 2:
                     netloc = parts[0]
                     rest = '/'.join(parts[1:])
-                    url_to_local.setdefault(f"https://{netloc}/{rest}", rel)
-                    url_to_local.setdefault(f"http://{netloc}/{rest}", rel)
+                    possible_https = f"https://{netloc}/{rest}"
+                    possible_http = f"http://{netloc}/{rest}"
+                    url_to_local.setdefault(possible_https, rel)
+                    url_to_local.setdefault(possible_http, rel)
+
+        # Now rewrite HTML
+        # Attribute regex: attr= "value" or attr='value' with non-greedy match
+        attr_pattern = re.compile(r'(\b(?:src|href|poster|action)\s*=\s*)(["\'])(.*?)\2', flags=re.I | re.S)
+        # CSS url(...) pattern
+        css_url_pattern = re.compile(r'url\(\s*(["\']?)(.*?)\1\s*\)', flags=re.I | re.S)
 
         for root_dir, _, files in os.walk(tmpdir):
             for fn in files:
@@ -541,33 +563,39 @@ def run_mirror_job(jobid: str, start_url: str):
                     continue
                 full = os.path.join(root_dir, fn)
                 try:
-                    with open(full, 'r', encoding='utf-8') as fh:
+                    with open(full, 'r', encoding='utf-8', errors='replace') as fh:
                         html = fh.read()
-                    base_url = start_url
+                    # determine base_url from saved path if possible
                     rel = os.path.relpath(full, tmpdir).replace(os.sep, '/')
                     m = re.match(r'(snapshot_\d+)\/([^\/]+)\/(.*)', rel)
+                    base_url = start_url
                     if m:
                         netloc = m.group(2)
                         base_url = f"https://{netloc}/"
-                    def repl_attr(m):
-                        prefix = m.group(1)
-                        orig = m.group(2)
-                        quote = m.group(3)
+
+                    def repl_attr(match):
+                        prefix = match.group(1)
+                        quote = match.group(2)
+                        orig = match.group(3) or ''
                         abs_url = normalize_url(base_url, orig) or orig
                         local = url_to_local.get(abs_url)
                         if local:
-                            return prefix + local + quote
-                        return prefix + orig + quote
-                    new_html = re.sub(r'(\b(?:src|href|poster|action)\s*=\s*["\'])(.*?)(["\'])', repl_attr, html, flags=re.I)
-                    def repl_css(m):
-                        prefix = m.group(1)
-                        orig = m.group(2)
+                            return f"{prefix}{quote}{local}{quote}"
+                        # keep same relative reference otherwise
+                        return f"{prefix}{quote}{orig}{quote}"
+
+                    new_html = attr_pattern.sub(repl_attr, html)
+
+                    def repl_css(match):
+                        orig = match.group(2) or ''
                         abs_url = normalize_url(base_url, orig) or orig
                         local = url_to_local.get(abs_url)
                         if local:
-                            return 'url(' + local + ')'
-                        return 'url(' + orig + ')'
-                    new_html = re.sub(r'(?i)(url\(["\']?)(.*?)["\']?\)', repl_css, new_html)
+                            return f"url({local})"
+                        return f"url({orig})"
+
+                    new_html = css_url_pattern.sub(repl_css, new_html)
+
                     with open(full, 'w', encoding='utf-8') as fh:
                         fh.write(new_html)
                     job['logs'].append(f"Rewrote {os.path.relpath(full, tmpdir)}")
@@ -580,7 +608,7 @@ def run_mirror_job(jobid: str, start_url: str):
             for root_dir, _, files in os.walk(tmpdir):
                 for fn in files:
                     full = os.path.join(root_dir, fn)
-                    arcname = os.path.relpath(full, tmpdir)
+                    arcname = os.path.relpath(full, tmpdir).replace(os.sep, '/')
                     zf.write(full, arcname)
         zip_io.seek(0)
         job['zip_bytes'] = zip_io.read()
@@ -617,7 +645,7 @@ def cleanup_worker():
 cleanup_thread = threading.Thread(target=cleanup_worker, daemon=True)
 cleanup_thread.start()
 
-# UI template (simplified)
+# Full UI HTML (kept inline for single-file distribution)
 INDEX_HTML = """
 <!doctype html>
 <html>
@@ -631,6 +659,7 @@ button{background:#06b6d4;border:none;color:#012;padding:8px 12px;border-radius:
 .endpoints{max-height:120px;overflow:auto;background:#021024;padding:8px;border-radius:8px}
 .grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
 .small{color:#94a3b8;font-size:13px}
+.row{display:flex;align-items:center}
 </style>
 </head>
 <body>
@@ -639,7 +668,7 @@ button{background:#06b6d4;border:none;color:#012;padding:8px 12px;border-radius:
   <div class="small">Use responsibly. Only crawl sites you own or have permission to crawl.</div>
 
   <div style="margin-top:12px">
-    <label>URL: <input id="url" type="url" placeholder="https://example.com"></label>
+    <label>URL: <input id="url" type="url" placeholder="https://example.com" style="width:70%"></label>
   </div>
 
   <div class="grid" style="margin-top:8px">
@@ -666,7 +695,7 @@ button{background:#06b6d4;border:none;color:#012;padding:8px 12px;border-radius:
 
   <div style="margin-top:8px" class="row">
     <button id="startBtn">Start</button>
-    <button id="clearBtn">Clear</button>
+    <button id="clearBtn" style="margin-left:8px">Clear</button>
     <div style="margin-left:auto" id="jobLinks"></div>
   </div>
 
@@ -676,7 +705,7 @@ button{background:#06b6d4;border:none;color:#012;padding:8px 12px;border-radius:
   <div class="endpoints" id="endpoints">No endpoints yet</div>
   <div style="margin-top:8px" class="row">
     <button id="capture_selected">Capture selected endpoints</button>
-    <button id="capture_all">Capture all endpoints</button>
+    <button id="capture_all" style="margin-left:8px">Capture all endpoints</button>
   </div>
 
   <div style="margin-top:12px" id="screenshotArea"></div>
@@ -857,25 +886,26 @@ def capture_endpoints(jobid):
                 except Exception:
                     browser = p.chromium.launch(headless=True)
                 context = browser.new_context(ignore_https_errors=True)
+                api_folder = os.path.join(job.get('tmpdir') or tempfile.gettempdir(), f"snapshot_0", "api_responses")
+                ensure_parent(os.path.join(api_folder, 'placeholder.txt'))
                 for ep in to_capture:
                     try:
                         if job.get('same_host_only') and not same_host(job.get('url'), ep):
                             with JOBS_LOCK:
                                 job['logs'].append(f"Skipping endpoint (different host): {ep}")
                             continue
-                        resp = context.request.get(ep, timeout=job.get('per_page_timeout',30)*1000)
+                        resp = context.request.get(ep, timeout=max(1, int(job.get('per_page_timeout',30)))*1000)
                         content = resp.body()
-                        if not content:
+                        if content is None or len(content) == 0:
                             with JOBS_LOCK:
-                                job['logs'].append(f"Endpoint empty: {ep} (status {resp.status})")
+                                job['logs'].append(f"Endpoint empty: {ep} (status {getattr(resp,'status', 'unknown')})")
                             continue
-                        api_folder = os.path.join(job.get('tmpdir'), f"snapshot_0", "api_responses")
-                        ensure_parent(os.path.join(api_folder, 'placeholder.txt'))
                         ct = resp.headers.get('content-type', '')
                         ext = ext_from_content_type(ct) or '.bin'
                         h = hashlib.sha1(ep.encode('utf-8')).hexdigest()[:12]
-                        fname = f"{h}_{resp.status}{ext}"
+                        fname = f"{h}_{getattr(resp,'status',0)}{ext}"
                         local = os.path.join(api_folder, fname)
+                        ensure_parent(local)
                         with open(local, 'wb') as fh:
                             fh.write(content)
                         rel = os.path.relpath(local, job.get('tmpdir')).replace(os.sep, '/')
@@ -920,7 +950,11 @@ def download(jobid):
         if job.get('status') != 'done' or not job.get('zip_bytes'):
             abort(404)
         data = job['zip_bytes']
-    return send_file(io.BytesIO(data), mimetype='application/zip', as_attachment=True, download_name=f'ghost_clone_{jobid}.zip')
+    bio = io.BytesIO(data)
+    try:
+        return send_file(bio, mimetype='application/zip', as_attachment=True, download_name=f'ghost_clone_{jobid}.zip')
+    except TypeError:
+        return send_file(bio, mimetype='application/zip', as_attachment=True, attachment_filename=f'ghost_clone_{jobid}.zip')
 
 if __name__ == '__main__':
     try:
