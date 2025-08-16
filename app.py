@@ -1,16 +1,10 @@
-# app.py
-#!/usr/bin/env python3
 """
-Ghost Advance — Selenium Website Cloner (single-file)
-- Web UI to mirror a page into an ephemeral folder (no persistent history).
-- Uses Selenium + Chrome/Chromium. You must have Chrome/Chromium installed on the host.
-- webdriver-manager is used to automatically fetch a matching chromedriver binary.
-- Run:
-    pip install -r requirements.txt
-    python app.py
-Notes:
-- On some hosts (containers), you may need to run Chrome with extra flags (--no-sandbox, --disable-dev-shm-usage).
-- This app is designed for quick ephemeral snapshots. Large sites may take a long time or fail due to resource/time limits.
+Ghost Advance — Playwright Website Cloner (single-file, Render-friendly)
+- Uses Playwright (Chromium). This script will attempt to auto-install Playwright browsers
+  at first run by invoking: python -m playwright install chromium
+- Install requirements: pip install -r requirements.txt
+- If deploying to Render, add a build step to run: python -m playwright install chromium
+  (or let the app attempt to install at runtime; build-time is preferred).
 """
 import os
 import re
@@ -19,25 +13,25 @@ import sys
 import time
 import json
 import zipfile
-import uuid
 import hashlib
 import tempfile
 import threading
 import traceback
 import mimetypes
 import shutil
-from urllib.parse import urljoin, urlparse, unquote
+import uuid
+import subprocess
+from urllib.parse import urlparse, urljoin, unquote
 
-import requests
 from flask import Flask, request, jsonify, send_file, render_template_string, abort
+import requests
 
-# Selenium imports
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
-from webdriver_manager.chrome import ChromeDriverManager
-
-HEADERS = {'User-Agent': 'Mozilla/5.0 (mirror script)'}
+# Try import playwright
+try:
+    from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
+except Exception:
+    sync_playwright = None
+    PlaywrightTimeout = Exception
 
 app = Flask(__name__)
 app.config['JSONIFY_PRETTYPRINT_REGULAR'] = False
@@ -45,9 +39,12 @@ app.config['JSONIFY_PRETTYPRINT_REGULAR'] = False
 # In-memory job store
 JOBS = {}
 JOBS_LOCK = threading.Lock()
-CLEANUP_SECONDS = 15 * 60  # seconds after completion to keep data
+CLEANUP_SECONDS = 15 * 60  # seconds to keep artifacts after finish
+PLAYWRIGHT_LOCK = threading.Lock()  # serialize access to playwright (safer)
 
-# ---------------- Utilities ----------------
+HEADERS = {'User-Agent': 'Mozilla/5.0 (ghost-clone)'}
+
+# Utility helpers
 def safe_component(s: str) -> str:
     s = unquote(s or "")
     return re.sub(r'[^A-Za-z0-9._\-/]', '_', s)
@@ -78,7 +75,47 @@ def ext_from_content_type(ct: str):
         return ''
     return mimetypes.guess_extension(ct.split(';', 1)[0].strip() or '') or ''
 
-# ---------------- Mirror worker (Selenium) ----------------
+def ensure_playwright_browsers():
+    """
+    Ensure Playwright browsers are installed. Prefer doing this at build time,
+    but if not installed, try to run: python -m playwright install chromium
+    """
+    global sync_playwright
+    if sync_playwright is None:
+        try:
+            # Try import again in case package was just installed
+            from playwright.sync_api import sync_playwright as sp, TimeoutError as PlaywrightTimeoutLocal
+            sync_playwright = sp
+        except Exception:
+            pass
+
+    # If playwright import exists, test launching. If fails, attempt install.
+    if sync_playwright is None:
+        return False, "playwright package not installed. pip install -r requirements.txt"
+
+    # Test if browsers are installed by trying to run sync_playwright and launching browser
+    try:
+        with PLAYWRIGHT_LOCK:
+            with sync_playwright() as p:
+                # attempt to launch headless chromium
+                browser = p.chromium.launch(headless=True)
+                browser.close()
+        return True, None
+    except Exception as e:
+        # Try to run install
+        try:
+            # Run install - this may be slow; do at startup/build time if possible
+            subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=False)
+            # try again
+            with PLAYWRIGHT_LOCK:
+                with sync_playwright() as p:
+                    browser = p.chromium.launch(headless=True)
+                    browser.close()
+            return True, None
+        except Exception as ex2:
+            return False, f"Playwright browser launch failed: {ex2} (original: {e})"
+
+# Background mirror worker using Playwright sync API
 def run_mirror_job(jobid: str, url: str):
     with JOBS_LOCK:
         job = JOBS.get(jobid)
@@ -91,172 +128,133 @@ def run_mirror_job(jobid: str, url: str):
     job['status'] = 'running'
     job['started_at'] = time.time()
 
-    # Setup Selenium Chrome options
-    options = Options()
-    options.add_argument('--headless=new')  # use new headless where available
-    options.add_argument('--disable-gpu')
-    options.add_argument('--no-sandbox')
-    options.add_argument('--disable-dev-shm-usage')
-    options.add_argument('--log-level=3')
-    options.add_experimental_option('excludeSwitches', ['enable-logging'])
-    # Enable performance logging to capture network events
-    options.set_capability('goog:loggingPrefs', {'performance': 'ALL'})
-
-    try:
-        # Install or find chromedriver via webdriver-manager
-        service = Service(ChromeDriverManager().install())
-        driver = webdriver.Chrome(service=service, options=options)
-    except Exception as e:
-        job['logs'].append(f"ERROR launching Chrome driver: {e}")
-        job['logs'].append(traceback.format_exc())
+    ok, msg = ensure_playwright_browsers()
+    if not ok:
+        job['logs'].append("ERROR: Playwright/browser not available: " + (msg or "unknown"))
         job['status'] = 'error'
         job['finished_at'] = time.time()
         return
 
     try:
-        job['logs'].append("Chrome started. Navigating to URL...")
-        driver.set_page_load_timeout(60)
-        try:
-            driver.get(url)
-        except Exception as e:
-            # page load may timeout but we still want to try to collect resources/page_source
-            job['logs'].append(f"Note: page.get() raised: {e}")
+        with PLAYWRIGHT_LOCK:
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-dev-shm-usage'])
+                context = browser.new_context(ignore_https_errors=True)
+                page = context.new_page()
 
-        # small wait for dynamic loads
-        driver.implicitly_wait(2)
-        time.sleep(1.5)
+                job['logs'].append("Browser launched. Attaching response handler...")
 
-        # 1) Collect resource URLs via Chrome performance logs (Network.requestWillBeSent)
-        resource_urls = set()
-        try:
-            for entry in driver.get_log('performance'):
+                # Save responses
+                def handle_response(response):
+                    try:
+                        rurl = response.url
+                        if not isinstance(rurl, str) or not rurl.startswith('http'):
+                            return
+                        # Avoid saving huge streaming requests repeatedly: skip very large or non-needed types?
+                        try:
+                            body = response.body()
+                        except Exception:
+                            return
+                        if not body:
+                            return
+                        local = make_local_path(tmpdir, rurl)
+                        ensure_parent(local)
+                        # add extension if missing
+                        if os.path.splitext(local)[1] == '':
+                            ctype = response.headers.get('content-type', '')
+                            ext = ext_from_content_type(ctype)
+                            if ext:
+                                local += ext
+                        with open(local, 'wb') as fh:
+                            fh.write(body)
+                        job['saved_count'] += 1
+                        job['logs'].append(f"Saved resource: {rurl} -> {os.path.relpath(local, tmpdir)}")
+                    except Exception as e:
+                        job['logs'].append(f"Warn: failed saving response {getattr(response,'url', 'unknown')}: {e}")
+
+                page.on("response", handle_response)
+
+                job['logs'].append("Navigating to URL...")
                 try:
-                    msg = json.loads(entry['message'])['message']
-                    if msg.get('method') == 'Network.requestWillBeSent':
-                        req_url = msg.get('params', {}).get('request', {}).get('url', '')
-                        if req_url.startswith('http'):
-                            resource_urls.add(req_url)
-                except Exception:
-                    continue
-            job['logs'].append(f"Collected {len(resource_urls)} resources from performance log.")
-        except Exception as e:
-            job['logs'].append(f"Warn: could not get performance logs: {e}")
+                    page.goto(url, timeout=60_000, wait_until="domcontentloaded")
+                    job['logs'].append("DOM content loaded.")
+                except PlaywrightTimeout:
+                    job['logs'].append("Note: page.goto timed out; continuing to collect resources.")
+                except Exception as e:
+                    job['logs'].append(f"Note: page.goto error: {e}")
 
-        # 2) Scrape final DOM for common resource attributes
-        try:
-            html = driver.page_source
-            attrs = re.findall(
-                r'(?:src|href|poster|action|data-src)\s*=\s*["\'](.*?)["\']',
-                html,
-                flags=re.I
-            )
-            added = 0
-            for attr in attrs:
-                abs_url = urljoin(url, attr)
-                if abs_url.startswith('http') and abs_url not in resource_urls:
-                    resource_urls.add(abs_url)
-                    added += 1
-            job['logs'].append(f"Scraped DOM and added {added} resources.")
-        except Exception as e:
-            html = ""
-            job['logs'].append(f"Warn: could not read page_source: {e}")
+                job['logs'].append("Waiting briefly for late XHR/fetch...")
+                page.wait_for_timeout(3000)
 
-        # 3) Use JS performance entries (XHR/fetch etc)
-        try:
-            entries = driver.execute_script(
-                'return window.performance.getEntriesByType("resource").map(e=>e.name)'
-            )
-            added = 0
-            for u in entries:
-                if isinstance(u, str) and u.startswith('http') and u not in resource_urls:
-                    resource_urls.add(u)
-                    added += 1
-            job['logs'].append(f"Performance entries added {added} resources.")
-        except Exception:
-            pass
-
-        # Ensure we include the page URL itself
-        resource_urls.add(url)
-
-        # Download each resource
-        url_to_local = {}
-        job['logs'].append(f"Downloading {len(resource_urls)} resources...")
-        for remote_url in sorted(resource_urls):
-            try:
-                parsed = urlparse(remote_url)
-                path = parsed.path.lstrip('/') or 'index'
-                local_path = os.path.join(tmpdir, parsed.netloc, path)
-                ensure_parent(local_path)
-
-                # Add extension if missing by checking HEAD content-type
+                # Save main HTML
                 try:
-                    h = requests.head(remote_url, headers=HEADERS, allow_redirects=True, timeout=10)
-                    ctype = h.headers.get('content-type', '').split(';')[0]
-                    ext = mimetypes.guess_extension(ctype) or ''
-                    if ext and not local_path.lower().endswith(ext.lower()):
-                        local_path += ext
-                except Exception:
-                    pass
+                    html = page.content()
+                    index_path = os.path.join(tmpdir, urlparse(url).netloc, 'index.html')
+                    ensure_parent(index_path)
+                    with open(index_path, 'w', encoding='utf-8') as fh:
+                        fh.write(html)
+                    job['logs'].append(f"Saved main HTML: {os.path.relpath(index_path, tmpdir)}")
+                except Exception as e:
+                    job['logs'].append(f"Warn: could not save main HTML: {e}")
+                    html = ''
 
-                if os.path.exists(local_path):
-                    url_to_local[remote_url] = os.path.relpath(local_path, tmpdir).replace(os.sep, '/')
-                    continue
+                # Screenshot
+                try:
+                    shot_path = os.path.join(tmpdir, 'screenshot.png')
+                    page.screenshot(path=shot_path, full_page=False)
+                    job['screenshot'] = shot_path
+                    job['logs'].append("Saved screenshot.")
+                except Exception as e:
+                    job['logs'].append(f"Warn: screenshot failed: {e}")
 
-                job['logs'].append(f"⬇ {remote_url}")
-                r = requests.get(remote_url, headers=HEADERS, stream=True, timeout=20)
-                r.raise_for_status()
-                with open(local_path, 'wb') as f:
-                    for chunk in r.iter_content(8192):
-                        if not chunk:
-                            continue
-                        f.write(chunk)
-                url_to_local[remote_url] = os.path.relpath(local_path, tmpdir).replace(os.sep, '/')
-                job['saved_count'] += 1
-            except Exception as e:
-                job['logs'].append(f"⚠ skip {remote_url} -> {e}")
+                browser.close()
 
-        # If we have page HTML (from earlier), rewrite resource URLs to local paths
+        # After browser closed, rewrite HTML to point to local assets (attempt)
         try:
             if not html:
-                html = driver.page_source or ''
+                # If earlier saving failed, try to read the saved file
+                saved_index = os.path.join(tmpdir, urlparse(url).netloc, 'index.html')
+                if os.path.exists(saved_index):
+                    with open(saved_index, 'r', encoding='utf-8') as fh:
+                        html = fh.read()
+                else:
+                    html = ''
+            # Build map of saved files
+            url_to_local = {}
+            for root, _, files in os.walk(tmpdir):
+                for fn in files:
+                    full = os.path.join(root, fn)
+                    rel = os.path.relpath(full, tmpdir).replace(os.sep, '/')
+                    # reconstruct original URL heuristically from folder structure: netloc/path...
+                    parts = rel.split('/', 1)
+                    if len(parts) == 2:
+                        netloc, pth = parts
+                        possible_url = f"https://{netloc}/{pth}"
+                        url_to_local[possible_url] = rel
+
+            # Replace src/href/action/poster values
             def replace_url(match):
                 orig = match.group(2)
                 abs_url = urljoin(url, orig)
                 local = url_to_local.get(abs_url, orig)
                 return match.group(1) + local + match.group(3)
 
-            new_html = re.sub(
-                r'(\b(?:src|href|poster|action)\s*=\s*["\'])(.*?)(["\'])',
-                replace_url,
-                html,
-                flags=re.I,
-            )
-            # rewrite CSS url(...)
-            new_html = re.sub(
-                r'(?i)(url\(["\']?)(.*?)["\']?\)',
-                lambda m: 'url(' + url_to_local.get(urljoin(url, m.group(2)), m.group(2)) + ')',
-                new_html,
-            )
+            new_html = re.sub(r'(\b(?:src|href|poster|action)\s*=\s*["\'])(.*?)(["\'])',
+                              replace_url, html, flags=re.I)
+            new_html = re.sub(r'(?i)(url\(["\']?)(.*?)["\']?\)',
+                              lambda m: 'url(' + url_to_local.get(urljoin(url, m.group(2)), m.group(2)) + ')',
+                              new_html)
 
             index_path = os.path.join(tmpdir, urlparse(url).netloc, 'index.html')
             ensure_parent(index_path)
-            with open(index_path, 'w', encoding='utf-8') as f:
-                f.write(new_html)
+            with open(index_path, 'w', encoding='utf-8') as fh:
+                fh.write(new_html)
             job['logs'].append(f"Wrote rewritten HTML to {os.path.relpath(index_path, tmpdir)}")
         except Exception as e:
-            job['logs'].append(f"Warn: failed to rewrite/save HTML: {e}")
-
-        # Save screenshot
-        try:
-            shot_path = os.path.join(tmpdir, 'screenshot.png')
-            driver.save_screenshot(shot_path)
-            job['screenshot'] = shot_path
-            job['logs'].append("Saved screenshot.")
-        except Exception as e:
-            job['logs'].append(f"Warn: screenshot failed: {e}")
+            job['logs'].append(f"Warn: rewriting HTML failed: {e}")
 
         # Package into ZIP
-        job['logs'].append("Packaging into ZIP...")
+        job['logs'].append("Packaging files into ZIP...")
         zip_io = io.BytesIO()
         with zipfile.ZipFile(zip_io, 'w', compression=zipfile.ZIP_DEFLATED) as zf:
             for root, _, files in os.walk(tmpdir):
@@ -276,12 +274,10 @@ def run_mirror_job(jobid: str, url: str):
         job['status'] = 'error'
         job['finished_at'] = time.time()
     finally:
-        try:
-            driver.quit()
-        except Exception:
-            pass
+        # leave tmpdir for a bit; cleanup thread will remove it
+        pass
 
-# ---------------- Cleanup thread ----------------
+# Cleanup thread to remove old job artifacts
 def cleanup_worker():
     while True:
         now = time.time()
@@ -304,19 +300,18 @@ def cleanup_worker():
 cleanup_thread = threading.Thread(target=cleanup_worker, daemon=True)
 cleanup_thread.start()
 
-# ---------------- Web UI HTML ----------------
+# HTML UI
 INDEX_HTML = """
 <!doctype html>
 <html>
 <head>
   <meta charset="utf-8">
-  <title>Ghost Advance — Selenium Cloner</title>
+  <title>Ghost Advance — Playwright Cloner</title>
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <style>
-    :root{--bg:#071026;--card:#0b1220;--muted:#94a3b8;--accent:#06b6d4;--glass:rgba(255,255,255,0.03)}
+    :root{--card:#0b1220;--muted:#94a3b8;--accent:#06b6d4;--glass:rgba(255,255,255,0.03)}
     body{margin:0;font-family:Inter,system-ui,Segoe UI,Arial;background:linear-gradient(180deg,#071024 0%, #071530 100%);color:#e6eef6}
     .wrap{max-width:980px;margin:28px auto;padding:20px}
-    header{display:flex;align-items:center;gap:16px}
     h1{margin:0;font-size:20px}
     .card{background:var(--card);padding:16px;border-radius:12px;box-shadow:0 6px 24px rgba(2,6,23,0.6);margin-top:18px}
     label{display:block;font-size:13px;color:var(--muted);margin-bottom:6px}
@@ -333,14 +328,10 @@ INDEX_HTML = """
 </head>
 <body>
   <div class="wrap">
-    <header>
-      <div>
-        <h1>Ghost Advance — Selenium Website Cloner</h1>
-        <small class="muted">Ephemeral one-shot mirror. No persistent history is stored.</small>
-      </div>
-    </header>
+    <h1>Ghost Advance — Playwright Website Cloner</h1>
+    <small class="muted">Ephemeral one-shot mirror. No persistent history is stored.</small>
 
-    <div class="card" id="ui-card">
+    <div class="card">
       <label for="url">Website URL</label>
       <div class="row">
         <input id="url" type="url" placeholder="https://example.com/">
@@ -364,7 +355,7 @@ INDEX_HTML = """
     </div>
 
     <footer>
-      Tip: For very large or complex sites, consider using specialized tools. This snapshot is ephemeral and short-lived.
+      Tip: For large sites, use dedicated mirroring tools. This snapshot is ephemeral and short-lived.
     </footer>
   </div>
 
@@ -442,7 +433,7 @@ function startPolling(){
 </html>
 """
 
-# ---------------- Routes ----------------
+# API routes
 @app.route('/')
 def index():
     return render_template_string(INDEX_HTML)
@@ -523,7 +514,16 @@ def download(jobid):
         download_name=f'ghost_clone_{jobid}.zip'
     )
 
-# ---------------- Run ----------------
+# Run server
 if __name__ == '__main__':
+    # Attempt to install browsers at startup (best to have done this during build)
+    try:
+        ok, msg = ensure_playwright_browsers()
+        if not ok:
+            print("Playwright/browsers not ready:", msg, file=sys.stderr)
+            print("You can run: python -m playwright install chromium", file=sys.stderr)
+    except Exception as e:
+        print("Playwright install check failed:", e, file=sys.stderr)
+
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=False)
