@@ -1,0 +1,4 @@
+Flask>=2.0
+requests>=2.25
+selenium>=4.8
+webdriver-manager>=3.8
