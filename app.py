@@ -1,10 +1,7 @@
 #!/usr/bin/env python3
 """
 Ghost Advance — Playwright Website Cloner (single-file, Render-friendly)
-- Uses Playwright (Chromium) installed at build time by the Dockerfile.
-- Advanced options: parallel workers, robots.txt, BFS/DFS, depth limit, mobile+desktop snapshots,
-  discovered endpoints listing and selectable capture, live logs, ZIP download.
-- WARNING: Use responsibly and only on sites you are allowed to crawl.
+Fixed quoting/regex issues.
 """
 import os
 import re
@@ -130,7 +127,10 @@ def worker_func(jobid, url_queue, visited_set, visited_lock, job_opts, tmpdir, s
     try:
         with sync_playwright() as p:
             mobile_device = p.devices.get('iPhone 12') or p.devices.get('iPhone 11') or {}
-            browser = p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-dev-shm-usage'])
+            try:
+                browser = p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-dev-shm-usage'])
+            except Exception:
+                browser = p.chromium.launch(headless=True)
             desktop_ctx = browser.new_context(ignore_https_errors=True)
             try:
                 mobile_ctx = browser.new_context(ignore_https_errors=True, **mobile_device)
@@ -342,9 +342,11 @@ def worker_func(jobid, url_queue, visited_set, visited_lock, job_opts, tmpdir, s
                     for st in (data.get('scripts') or []):
                         if not st:
                             continue
-                        for m in re.finditer(r'(https?://[\\w\\-\\.\\/:?&=#%]+)', st):
+                        # fixed regex for absolute URLs in script text
+                        for m in re.finditer(r'(https?://[\w\-\./:?&=#%]+)', st):
                             discovered_endpoints.add(m.group(1))
-                        for m in re.finditer(r'([\\'\\"])(/[^\\'\\"]*?/api/[^\\'\\"]*)([\\'\\"])', st, flags=re.I):
+                        # fixed regex for api-like relative paths quoted in scripts
+                        for m in re.finditer(r'(["\'])(/[^"\']*?/api/[^"\']*)(["\'])', st, flags=re.I):
                             candidate = m.group(2)
                             candidate_abs = normalize_url(cur, candidate)
                             if candidate_abs:
@@ -615,7 +617,7 @@ def cleanup_worker():
 cleanup_thread = threading.Thread(target=cleanup_worker, daemon=True)
 cleanup_thread.start()
 
-# UI template (simplified but functional)
+# UI template (simplified)
 INDEX_HTML = """
 <!doctype html>
 <html>
@@ -850,7 +852,10 @@ def capture_endpoints(jobid):
             job['logs'].append(f"Starting capture of {len(to_capture)} endpoints")
         try:
             with sync_playwright() as p:
-                browser = p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-dev-shm-usage'])
+                try:
+                    browser = p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-dev-shm-usage'])
+                except Exception:
+                    browser = p.chromium.launch(headless=True)
                 context = browser.new_context(ignore_https_errors=True)
                 for ep in to_capture:
                     try:
