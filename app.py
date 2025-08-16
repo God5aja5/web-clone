@@ -2,7 +2,7 @@
 """
 app.py — Ghost Advance (single-file) website cloner using Playwright + Flask.
 
-Save this file as app.py. To run:
+Save as app.py and run:
   python -m venv venv
   source venv/bin/activate   (Windows: venv\Scripts\activate)
   pip install flask playwright
@@ -47,7 +47,6 @@ JOBS_LOCK = threading.Lock()
 CLEANUP_SECONDS = 15 * 60
 HEADERS = {'User-Agent': 'Mozilla/5.0 (ghost-clone)'}
 
-# Helpers
 def safe_component(s: str) -> str:
     s = unquote(s or "")
     return re.sub(r'[^A-Za-z0-9._\-/]', '_', s)
@@ -128,7 +127,8 @@ def ensure_playwright_browsers():
         except Exception as ex2:
             return False, f"Playwright browser launch failed: {ex2} (original: {e})"
 
-# Worker
+# Worker: saves responses under assets/, only saves HTML for proper pages,
+# and optionally restricts saved resources to same_host_only.
 def worker_func(jobid, url_queue, visited_set, visited_lock, job_opts, tmpdir, snapshot_idx, job_ref, stop_event):
     try:
         with sync_playwright() as p:
@@ -157,7 +157,6 @@ def worker_func(jobid, url_queue, visited_set, visited_lock, job_opts, tmpdir, s
                 except queue.Empty:
                     break
 
-                # runtime/resource caps
                 if job_opts.get('max_runtime') and job_opts['max_runtime'] > 0:
                     if time.time() - job_opts['job_start_time'] > job_opts['max_runtime']:
                         with JOBS_LOCK:
@@ -200,6 +199,9 @@ def worker_func(jobid, url_queue, visited_set, visited_lock, job_opts, tmpdir, s
                         try:
                             rurl = resp.url
                             if not isinstance(rurl, str) or not rurl.startswith('http'):
+                                return
+                            # respect same_host_only option: skip saving external resources if requested
+                            if job_opts.get('same_host_only') and not same_host(job_opts['start_url'], rurl):
                                 return
                             try:
                                 body = resp.body()
@@ -306,7 +308,6 @@ def worker_func(jobid, url_queue, visited_set, visited_lock, job_opts, tmpdir, s
                             rel = os.path.relpath(local_html, tmpdir).replace(os.sep, '/')
                             with JOBS_LOCK:
                                 job_ref['logs'].append(f"[{label}] Saved HTML: {rel}")
-                                # only set HTML mapping if asset mapping doesn't already exist
                                 job_ref.setdefault('url_to_local', {}).setdefault(cur, rel)
                         except Exception as e:
                             with JOBS_LOCK:
@@ -375,7 +376,8 @@ def worker_func(jobid, url_queue, visited_set, visited_lock, job_opts, tmpdir, s
                             candidate = m.group(2)
                             candidate_abs = normalize_url(cur, candidate)
                             if candidate_abs:
-                                discovered_endpoints.add(candidate_abs)
+                                if not job_opts.get('same_host_only') or same_host(job_opts['start_url'], candidate_abs):
+                                    discovered_endpoints.add(candidate_abs)
 
                     with visited_lock:
                         if discovered_endpoints:
@@ -415,13 +417,13 @@ def worker_func(jobid, url_queue, visited_set, visited_lock, job_opts, tmpdir, s
             job_ref['logs'].append("Worker encountered error: " + str(e))
             job_ref['logs'].append(traceback.format_exc())
 
-# Main runner
+# Main runner: build a url->local map, prefer assets, rewrite with relative links,
+# optionally enforce same_host_only, and create ZIP without "snapshot_0/" prefix.
 def run_mirror_job(jobid: str, start_url: str):
     with JOBS_LOCK:
         job = JOBS.get(jobid)
     if not job:
         return
-
     job['logs'].append(f"Job {jobid} starting for {start_url}")
     job['status'] = 'running'
     job['started_at'] = time.time()
@@ -436,29 +438,21 @@ def run_mirror_job(jobid: str, start_url: str):
         return
 
     # options
-    advanced = bool(job.get('advanced', True))
-    obey_robots = bool(job.get('obey_robots', False))
     concurrency = max(1, int(job.get('concurrency', 1) or 1))
-    crawl_mode = job.get('crawl_mode', 'bfs')
     depth_limit = int(job.get('depth_limit', 0) or 0)
-    no_page_limit = job.get('no_page_limit', True)
-    max_pages = None if no_page_limit else int(job.get('max_pages', 100) or 100)
     snapshots = int(job.get('snapshots', 1) or 1)
-    same_host_only = bool(job.get('same_host_only', True))
-    follow_buttons = bool(job.get('follow_buttons', True))
     per_page_timeout = int(job.get('per_page_timeout', 30) or 30)
-    capture_api = bool(job.get('capture_api', True))
     max_runtime = int(job.get('max_runtime', 0) or 0)
     max_resources = int(job.get('max_resources', 0) or 0)
     auto_snapshot = bool(job.get('auto_snapshot', True))
-    auto_clone_all = True
+    same_host_only = bool(job.get('same_host_only', True))
+    follow_buttons = bool(job.get('follow_buttons', True))
 
     job_opts_template = {
         'start_url': start_url,
         'follow_buttons': follow_buttons,
         'per_page_timeout': per_page_timeout,
         'same_host_only': same_host_only,
-        'capture_api': capture_api,
         'max_runtime': max_runtime,
         'max_resources': max_resources,
         'auto_snapshot': auto_snapshot,
@@ -466,7 +460,7 @@ def run_mirror_job(jobid: str, start_url: str):
     }
 
     rp = None
-    if obey_robots:
+    if job.get('obey_robots'):
         try:
             parsed = urlparse(start_url)
             robots_url = f"{parsed.scheme}://{parsed.netloc}/robots.txt"
@@ -493,15 +487,8 @@ def run_mirror_job(jobid: str, start_url: str):
 
             job_opts = job_opts_template.copy()
             job_opts['robots_parser'] = rp
-            job_opts['follow_buttons'] = follow_buttons
             job_opts['start_url'] = start_url
-            job_opts['auto_snapshot'] = auto_snapshot
-            job_opts['depth_limit'] = depth_limit
-            job_opts['per_page_timeout'] = per_page_timeout
-            job_opts['max_runtime'] = max_runtime
-            job_opts['max_resources'] = max_resources
             job_opts['job_start_time'] = time.time()
-            job_opts['max_pages'] = max_pages
 
             stop_event = threading.Event()
             workers = []
@@ -524,11 +511,6 @@ def run_mirror_job(jobid: str, start_url: str):
                         job['logs'].append("Snapshot resource cap reached; stopping workers.")
                         stop_event.set()
                         break
-                    if max_pages is not None and not auto_clone_all:
-                        if len(visited) >= max_pages:
-                            job['logs'].append("Configured max_pages reached; stopping workers.")
-                            stop_event.set()
-                            break
                     time.sleep(1)
             finally:
                 stop_event.set()
@@ -586,7 +568,7 @@ def run_mirror_job(jobid: str, start_url: str):
                 preferred = rels[0]
             url_to_local[url] = preferred
 
-        # Rewrite HTML attribute refs and CSS url(...)
+        # Now perform HTML rewrites using relative paths (relative to the HTML file)
         attr_pattern = re.compile(r'(\b(?:src|href|poster|action)\s*=\s*)(["\'])(.*?)\2', flags=re.I | re.S)
         css_url_pattern = re.compile(r'url\(\s*(["\']?)(.*?)\1\s*\)', flags=re.I | re.S)
 
@@ -598,8 +580,8 @@ def run_mirror_job(jobid: str, start_url: str):
                 try:
                     with open(full, 'r', encoding='utf-8', errors='replace') as fh:
                         html = fh.read()
-                    rel = os.path.relpath(full, tmpdir).replace(os.sep, '/')
-                    m = re.match(r'(snapshot_\d+)\/([^\/]+)\/(.*)', rel)
+                    rel_html = os.path.relpath(full, tmpdir).replace(os.sep, '/')
+                    m = re.match(r'(snapshot_\d+)\/([^\/]+)\/(.*)', rel_html)
                     base_url = start_url
                     if m:
                         netloc = m.group(2)
@@ -612,7 +594,14 @@ def run_mirror_job(jobid: str, start_url: str):
                         abs_url = normalize_url(base_url, orig) or orig
                         local = url_to_local.get(abs_url)
                         if local:
-                            return f"{prefix}{quote}{local}{quote}"
+                            # compute relative path from this html file's directory to the asset file
+                            local_abs = os.path.join(tmpdir, local)
+                            try:
+                                rel_from_html = os.path.relpath(local_abs, os.path.dirname(full)).replace(os.sep, '/')
+                            except Exception:
+                                rel_from_html = local
+                            # Use relative path (no leading /) so serving extracted folder works
+                            return f"{prefix}{quote}{rel_from_html}{quote}"
                         return f"{prefix}{quote}{orig}{quote}"
 
                     new_html = attr_pattern.sub(repl_attr, html)
@@ -622,38 +611,54 @@ def run_mirror_job(jobid: str, start_url: str):
                         abs_url = normalize_url(base_url, orig) or orig
                         local = url_to_local.get(abs_url)
                         if local:
-                            return f"url({local})"
+                            local_abs = os.path.join(tmpdir, local)
+                            try:
+                                rel_from_html = os.path.relpath(local_abs, os.path.dirname(full)).replace(os.sep, '/')
+                            except Exception:
+                                rel_from_html = local
+                            return f"url({rel_from_html})"
                         return f"url({orig})"
 
                     new_html = css_url_pattern.sub(repl_css, new_html)
 
                     with open(full, 'w', encoding='utf-8') as fh:
                         fh.write(new_html)
-                    job['logs'].append(f"Rewrote {os.path.relpath(full, tmpdir)}")
+                    job['logs'].append(f"Rewrote {rel_html}")
                 except Exception as e:
                     job['logs'].append(f"Warn rewrite {full}: {e}")
 
+        # Package into ZIP — strip leading snapshot_0/ so archive extracts as domain/...
         job['logs'].append("Packaging into ZIP...")
         zip_io = io.BytesIO()
         with zipfile.ZipFile(zip_io, 'w', compression=zipfile.ZIP_DEFLATED) as zf:
             for root_dir, _, files in os.walk(tmpdir):
                 for fn in files:
                     full = os.path.join(root_dir, fn)
-                    arcname = os.path.relpath(full, tmpdir).replace(os.sep, '/')
+                    rel = os.path.relpath(full, tmpdir).replace(os.sep, '/')
+                    arcname = rel
+                    if rel.startswith('snapshot_'):
+                        # remove snapshot_x prefix, i.e. snapshot_0/domain/... -> domain/...
+                        parts = rel.split('/', 2)
+                        if len(parts) >= 3:
+                            arcname = parts[1] + '/' + parts[2]
+                        elif len(parts) == 2:
+                            arcname = parts[1]
+                        else:
+                            arcname = rel.split('/',1)[-1]
                     zf.write(full, arcname)
         zip_io.seek(0)
         job['zip_bytes'] = zip_io.read()
         job['status'] = 'done'
         job['finished_at'] = time.time()
         job['logs'].append("Job completed successfully.")
-    except Exception as exc:
+    except Exception:
         tb = traceback.format_exc()
         job['logs'].append("ERROR during mirroring:")
         job['logs'].append(tb)
         job['status'] = 'error'
         job['finished_at'] = time.time()
 
-# Cleanup thread
+# Cleanup
 def cleanup_worker():
     while True:
         now = time.time()
@@ -676,73 +681,28 @@ def cleanup_worker():
 cleanup_thread = threading.Thread(target=cleanup_worker, daemon=True)
 cleanup_thread.start()
 
-# Full UI HTML
-INDEX_HTML = """
-<!doctype html>
-<html>
-<head><meta charset="utf-8"><title>Ghost Advance</title><meta name="viewport" content="width=device-width,initial-scale=1">
-<style>
-body{background:#071024;color:#e6eef6;font-family:Inter,Arial;padding:14px}
-.card{background:#0b1220;padding:16px;border-radius:10px;max-width:1000px;margin:0 auto}
-input,select,textarea{padding:8px;border-radius:6px;background:rgba(255,255,255,0.02);border:1px solid rgba(255,255,255,0.03);color:inherit}
-button{background:#06b6d4;border:none;color:#012;padding:8px 12px;border-radius:8px;cursor:pointer}
-.logs{height:300px;overflow:auto;background:#021024;padding:12px;border-radius:8px;font-family:monospace}
-.endpoints{max-height:120px;overflow:auto;background:#021024;padding:8px;border-radius:8px}
-.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
-.small{color:#94a3b8;font-size:13px}
-.row{display:flex;align-items:center}
-a.link{color:#99f}
-</style>
-</head>
-<body>
-<div class="card">
-  <h2>Ghost Advance — Render-friendly</h2>
-  <div class="small">Use responsibly. Only crawl sites you own or have permission to crawl.</div>
-
-  <div style="margin-top:12px">
-    <label style="width:100%;">URL: <input id="url" type="url" placeholder="https://example.com" style="width:78%"></label>
-  </div>
-
-  <div class="grid" style="margin-top:8px">
-    <label><input id="advanced" type="checkbox" checked> Advanced</label>
-    <label><input id="obey" type="checkbox"> Obey robots.txt</label>
-    <label>Concurrency <input id="concurrency" type="number" value="1" min="1" max="4"></label>
-
-    <label>Crawl mode <select id="crawl_mode"><option value="bfs">BFS</option><option value="dfs">DFS</option></select></label>
-    <label>Depth limit <input id="depth_limit" type="number" value="0" min="0"></label>
-    <label>No page limit <input id="no_page_limit" type="checkbox" checked></label>
-
-    <label>Max pages <input id="max_pages" type="number" value="100" min="1"></label>
-    <label>Snapshots <input id="snapshots" type="number" value="1" min="1" max="5"></label>
-    <label>Same-host only <input id="same_host" type="checkbox" checked></label>
-
-    <label>Follow onclick heuristics <input id="follow_buttons" type="checkbox" checked></label>
-    <label>Capture API <input id="capture_api" type="checkbox" checked></label>
-    <label>Auto snapshot <input id="auto_snapshot" type="checkbox" checked></label>
-
-    <label>Per-page timeout (s) <input id="per_page_timeout" type="number" value="30" min="5"></label>
-    <label>Max runtime (s, 0 unlimited) <input id="max_runtime" type="number" value="0" min="0"></label>
-    <label>Max resources (0 unlimited) <input id="max_resources" type="number" value="0" min="0"></label>
-  </div>
-
-  <div style="margin-top:8px" class="row">
-    <button id="startBtn">Start</button>
-    <button id="clearBtn" style="margin-left:8px">Clear</button>
-    <div style="margin-left:auto" id="jobLinks"></div>
-  </div>
-
-  <div style="margin-top:12px" class="logs" id="logs">Logs will appear here...</div>
-
-  <h4 style="margin-top:12px">Discovered endpoints (select and Capture)</h4>
-  <div class="endpoints" id="endpoints">No endpoints yet</div>
-  <div style="margin-top:8px" class="row">
-    <button id="capture_selected">Capture selected endpoints</button>
-    <button id="capture_all" style="margin-left:8px">Capture all endpoints</button>
-  </div>
-
-  <div style="margin-top:12px" id="screenshotArea"></div>
+# UI HTML
+INDEX_HTML = """<!doctype html>
+<html><head><meta charset="utf-8"><title>Ghost Advance</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>body{font-family:Inter,Arial;padding:12px;background:#071024;color:#e6eef6} .card{background:#0b1220;padding:16px;border-radius:10px;max-width:1000px;margin:0 auto} input,select{padding:8px;border-radius:6px;background:rgba(255,255,255,0.02);border:1px solid rgba(255,255,255,0.03);color:inherit} button{background:#06b6d4;border:none;color:#012;padding:8px 12px;border-radius:8px;cursor:pointer} .logs{height:300px;overflow:auto;background:#021024;padding:12px;border-radius:8px;font-family:monospace} .endpoints{max-height:120px;overflow:auto;background:#021024;padding:8px;border-radius:8px} .grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}.small{color:#94a3b8;font-size:13px}.row{display:flex;align-items:center}</style>
+</head><body><div class="card">
+<h2>Ghost Advance — Render-friendly</h2>
+<div class="small">Use responsibly — only crawl sites you own or have permission to crawl.</div>
+<div style="margin-top:12px">URL: <input id="url" type="url" placeholder="https://example.com" style="width:70%"></div>
+<div class="grid" style="margin-top:8px">
+<label><input id="same_host" type="checkbox" checked> Copy same host only</label>
+<label>Concurrency <input id="concurrency" type="number" value="1" min="1" max="4"></label>
+<label>Snapshots <input id="snapshots" type="number" value="1" min="1" max="5"></label>
+<label>Depth limit <input id="depth_limit" type="number" value="0" min="0"></label>
+<label>Per-page timeout (s) <input id="per_page_timeout" type="number" value="30" min="5"></label>
+<label>Auto snapshot <input id="auto_snapshot" type="checkbox" checked></label>
 </div>
-
+<div style="margin-top:8px" class="row"><button id="startBtn">Start</button><button id="clearBtn" style="margin-left:8px">Clear</button><div style="margin-left:auto" id="jobLinks"></div></div>
+<div style="margin-top:12px" class="logs" id="logs">Logs will appear here...</div>
+<h4 style="margin-top:12px">Discovered endpoints</h4>
+<div class="endpoints" id="endpoints">No endpoints yet</div>
+</div>
 <script>
 let jobid = null; let pollTimer = null;
 document.getElementById('startBtn').onclick = async () => {
@@ -750,21 +710,12 @@ document.getElementById('startBtn').onclick = async () => {
   if (!url) { alert('Enter URL'); return; }
   const payload = {
     url,
-    advanced: document.getElementById('advanced').checked,
-    obey_robots: document.getElementById('obey').checked,
-    concurrency: Number(document.getElementById('concurrency').value || 1),
-    crawl_mode: document.getElementById('crawl_mode').value,
-    depth_limit: Number(document.getElementById('depth_limit').value || 0),
-    no_page_limit: document.getElementById('no_page_limit').checked,
-    max_pages: Number(document.getElementById('max_pages').value || 100),
-    snapshots: Number(document.getElementById('snapshots').value || 1),
     same_host_only: document.getElementById('same_host').checked,
-    follow_buttons: document.getElementById('follow_buttons').checked,
-    capture_api: document.getElementById('capture_api').checked,
-    auto_snapshot: document.getElementById('auto_snapshot').checked,
+    concurrency: Number(document.getElementById('concurrency').value || 1),
+    snapshots: Number(document.getElementById('snapshots').value || 1),
+    depth_limit: Number(document.getElementById('depth_limit').value || 0),
     per_page_timeout: Number(document.getElementById('per_page_timeout').value || 30),
-    max_runtime: Number(document.getElementById('max_runtime').value || 0),
-    max_resources: Number(document.getElementById('max_resources').value || 0)
+    auto_snapshot: document.getElementById('auto_snapshot').checked
   };
   const res = await fetch('/start', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
   const j = await res.json();
@@ -773,14 +724,10 @@ document.getElementById('startBtn').onclick = async () => {
   if (pollTimer) clearInterval(pollTimer);
   pollTimer = setInterval(pollStatus, 1200);
 };
-
 document.getElementById('clearBtn').onclick = () => {
-  document.getElementById('logs').innerText = '';
-  document.getElementById('endpoints').innerHTML = 'No endpoints yet';
-  if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
-  jobid = null; document.getElementById('jobLinks').innerHTML = ''; document.getElementById('screenshotArea').innerHTML = '';
+  document.getElementById('logs').innerText = ''; document.getElementById('endpoints').innerHTML = 'No endpoints yet';
+  if (pollTimer) { clearInterval(pollTimer); pollTimer = null; } jobid = null; document.getElementById('jobLinks').innerHTML = '';
 };
-
 async function pollStatus(){
   if (!jobid) return;
   try {
@@ -789,37 +736,18 @@ async function pollStatus(){
     if (lj.ok) { document.getElementById('logs').innerText = lj.logs.join('\\n'); const el=document.getElementById('logs'); el.scrollTop = el.scrollHeight; }
     if (sj.ok) {
       const links = document.getElementById('jobLinks'); links.innerHTML = '';
-      if (sj.status === 'done') { links.innerHTML = `<a class="link" href="/download/${jobid}">Download ZIP</a>`; document.getElementById('screenshotArea').innerHTML = `<img src="/screenshot/${jobid}" style="max-width:100%;margin-top:8px">`; }
+      if (sj.status === 'done') { links.innerHTML = `<a href="/download/${jobid}" style="color:#99f">Download ZIP</a>`; document.getElementById('logs').innerText += "\\nJob done."; }
     }
     if (ej.ok) {
       const endpoints = ej.endpoints || []; const container = document.getElementById('endpoints');
       if (!endpoints.length) { container.innerHTML = 'No endpoints yet'; } else {
-        container.innerHTML = endpoints.map(url => {
-          return `<div><label><input type="checkbox" data-url="${encodeURIComponent(url)}"> ${url}</label></div>`;
-        }).join('');
+        container.innerHTML = endpoints.map(url => `<div>${url}</div>`).join('');
       }
     }
   } catch(e){ console.error(e); }
 }
-
-document.getElementById('capture_selected').onclick = async () => {
-  if (!jobid) { alert('No job'); return; }
-  const checks = Array.from(document.querySelectorAll('#endpoints input[type=checkbox]:checked'));
-  if (!checks.length) { alert('Select endpoints'); return; }
-  const endpoints = checks.map(c => decodeURIComponent(c.getAttribute('data-url')));
-  const res = await fetch('/capture_endpoints/'+jobid, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({endpoints})});
-  const j = await res.json(); if (!j.ok) alert('Failed: '+(j.error||'unknown')); else alert('Capture started. See logs.');
-};
-
-document.getElementById('capture_all').onclick = async () => {
-  if (!jobid) { alert('No job'); return; }
-  const res = await fetch('/capture_endpoints/'+jobid, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({endpoints: null})});
-  const j = await res.json(); if (!j.ok) alert('Failed: '+(j.error||'unknown')); else alert('Capture started. See logs.');
-};
 </script>
-</body>
-</html>
-"""
+</body></html>"""
 
 @app.route('/')
 def index():
@@ -829,11 +757,8 @@ def index():
 def start():
     data = request.get_json(silent=True) or {}
     url = (data.get('url') or '').strip()
-    if not url:
-        return jsonify({'ok': False, 'error': 'no url provided'}), 400
-    if not re.match(r'^https?://', url):
-        return jsonify({'ok': False, 'error': 'url must start with http:// or https://'}), 400
-
+    if not url or not re.match(r'^https?://', url):
+        return jsonify({'ok': False, 'error': 'invalid url'}), 400
     jobid = hashlib.sha1(f"{url}-{time.time()}-{uuid.uuid4()}".encode('utf-8')).hexdigest()[:16]
     job = {
         'id': jobid,
@@ -846,26 +771,20 @@ def start():
         'saved_count': 0,
         'started_at': None,
         'finished_at': None,
-        'advanced': bool(data.get('advanced', True)),
-        'obey_robots': bool(data.get('obey_robots', False)),
-        'concurrency': int(data.get('concurrency', 1) or 1),
-        'crawl_mode': data.get('crawl_mode', 'bfs'),
-        'depth_limit': int(data.get('depth_limit', 0) or 0),
-        'no_page_limit': bool(data.get('no_page_limit', True)),
-        'max_pages': int(data.get('max_pages', 100) or 100),
-        'snapshots': int(data.get('snapshots', 1) or 1),
+        'concurrency': int(data.get('concurrency',1) or 1),
+        'depth_limit': int(data.get('depth_limit',0) or 0),
+        'snapshots': int(data.get('snapshots',1) or 1),
+        'per_page_timeout': int(data.get('per_page_timeout',30) or 30),
+        'max_runtime': int(data.get('max_runtime',0) or 0),
+        'max_resources': int(data.get('max_resources',0) or 0),
         'same_host_only': bool(data.get('same_host_only', True)),
         'follow_buttons': bool(data.get('follow_buttons', True)),
-        'capture_api': bool(data.get('capture_api', True)),
+        'obey_robots': bool(data.get('obey_robots', False)),
         'auto_snapshot': bool(data.get('auto_snapshot', True)),
-        'per_page_timeout': int(data.get('per_page_timeout', 30) or 30),
-        'max_runtime': int(data.get('max_runtime', 0) or 0),
-        'max_resources': int(data.get('max_resources', 0) or 0),
     }
     with JOBS_LOCK:
         JOBS[jobid] = job
-    t = threading.Thread(target=lambda: run_mirror_job(jobid, url), daemon=True)
-    t.start()
+    threading.Thread(target=lambda: run_mirror_job(jobid, url), daemon=True).start()
     return jsonify({'ok': True, 'jobid': jobid})
 
 @app.route('/logs/<jobid>')
@@ -892,87 +811,6 @@ def endpoints(jobid):
             return jsonify({'ok': False, 'error': 'job not found'}), 404
         eps = sorted(list(job.get('endpoints') or []))
         return jsonify({'ok': True, 'endpoints': eps})
-
-@app.route('/capture_endpoints/<jobid>', methods=['POST'])
-def capture_endpoints(jobid):
-    data = request.get_json(silent=True) or {}
-    endpoints = data.get('endpoints')
-    with JOBS_LOCK:
-        job = JOBS.get(jobid)
-        if not job:
-            return jsonify({'ok': False, 'error': 'job not found'}), 404
-        eps = sorted(list(job.get('endpoints') or []))
-    if endpoints is None:
-        to_capture = eps
-    else:
-        to_capture = endpoints
-    if not to_capture:
-        return jsonify({'ok': True, 'message': 'no endpoints to capture'})
-
-    def do_capture():
-        with JOBS_LOCK:
-            job['logs'].append(f"Starting capture of {len(to_capture)} endpoints")
-        try:
-            with sync_playwright() as p:
-                try:
-                    browser = p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-dev-shm-usage'])
-                except Exception:
-                    browser = p.chromium.launch(headless=True)
-                context = browser.new_context(ignore_https_errors=True)
-                api_folder = os.path.join(job.get('tmpdir') or tempfile.gettempdir(), f"snapshot_0", "api_responses")
-                ensure_parent(os.path.join(api_folder, 'placeholder.txt'))
-                for ep in to_capture:
-                    try:
-                        if job.get('same_host_only') and not same_host(job.get('url'), ep):
-                            with JOBS_LOCK:
-                                job['logs'].append(f"Skipping endpoint (different host): {ep}")
-                            continue
-                        resp = context.request.get(ep, timeout=max(1, int(job.get('per_page_timeout',30)))*1000)
-                        content = resp.body()
-                        if content is None or len(content) == 0:
-                            with JOBS_LOCK:
-                                job['logs'].append(f"Endpoint empty: {ep} (status {getattr(resp,'status', 'unknown')})")
-                            continue
-                        ct = resp.headers.get('content-type', '')
-                        ext = ext_from_content_type(ct) or '.bin'
-                        h = hashlib.sha1(ep.encode('utf-8')).hexdigest()[:12]
-                        fname = f"{h}_{getattr(resp,'status',0)}{ext}"
-                        local = os.path.join(api_folder, fname)
-                        ensure_parent(local)
-                        with open(local, 'wb') as fh:
-                            fh.write(content)
-                        rel = os.path.relpath(local, job.get('tmpdir')).replace(os.sep, '/')
-                        with JOBS_LOCK:
-                            job.setdefault('url_to_local', {})[ep] = rel
-                            job['logs'].append(f"Captured endpoint: {ep} -> {rel}")
-                            job['saved_count'] = job.get('saved_count',0) + 1
-                    except Exception as e:
-                        with JOBS_LOCK:
-                            job['logs'].append(f"Failed capture {ep}: {e}")
-                try:
-                    context.close()
-                except Exception:
-                    pass
-                try:
-                    browser.close()
-                except Exception:
-                    pass
-        except Exception as e:
-            with JOBS_LOCK:
-                job['logs'].append("Error capturing endpoints: " + str(e))
-    threading.Thread(target=do_capture, daemon=True).start()
-    return jsonify({'ok': True})
-
-@app.route('/screenshot/<jobid>')
-def screenshot(jobid):
-    with JOBS_LOCK:
-        job = JOBS.get(jobid)
-        if not job:
-            abort(404)
-        shot = job.get('screenshot')
-        if not shot or not os.path.exists(shot):
-            abort(404)
-        return send_file(shot, mimetype='image/png')
 
 @app.route('/download/<jobid>')
 def download(jobid):
