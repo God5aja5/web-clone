@@ -1,11 +1,10 @@
-# (Start of file)
+#!/usr/bin/env python3
 """
 Ghost Advance — Playwright Website Cloner (single-file, Render-friendly)
-- Uses Playwright (Chromium). This script will attempt to auto-install Playwright browsers
-  at first run by invoking: python -m playwright install chromium
-- Install requirements: pip install -r requirements.txt
-- If deploying to Render, add a build step to run: python -m playwright install chromium
-  (or let the app attempt to install at runtime; build-time is preferred).
+- Uses Playwright (Chromium) installed at build time by the Dockerfile.
+- Advanced options: parallel workers, robots.txt, BFS/DFS, depth limit, mobile+desktop snapshots,
+  discovered endpoints listing and selectable capture, live logs, ZIP download.
+- WARNING: Use responsibly and only on sites you are allowed to crawl.
 """
 import os
 import re
@@ -24,11 +23,12 @@ import uuid
 import subprocess
 from urllib.parse import urlparse, urljoin, unquote, urldefrag
 from collections import deque
+import queue
+import urllib.robotparser
 
 from flask import Flask, request, jsonify, send_file, render_template_string, abort
-import requests
 
-# Try import playwright
+# Playwright import
 try:
     from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
 except Exception:
@@ -38,23 +38,18 @@ except Exception:
 app = Flask(__name__)
 app.config['JSONIFY_PRETTYPRINT_REGULAR'] = False
 
-# In-memory job store
 JOBS = {}
 JOBS_LOCK = threading.Lock()
-CLEANUP_SECONDS = 15 * 60  # seconds to keep artifacts after finish
-PLAYWRIGHT_LOCK = threading.Lock()  # serialize access to playwright (safer)
+CLEANUP_SECONDS = 15 * 60
 
 HEADERS = {'User-Agent': 'Mozilla/5.0 (ghost-clone)'}
 
-# Utility helpers
+# Helpers
 def safe_component(s: str) -> str:
     s = unquote(s or "")
     return re.sub(r'[^A-Za-z0-9._\-/]', '_', s)
 
-def make_local_path(root: str, raw_url: str, snapshot_idx: int = 0) -> str:
-    """
-    Map a URL to a local path under tmpdir. Snapshot idx used to separate snapshots.
-    """
+def make_local_path(root: str, raw_url: str, snapshot_idx: int = 0, subfolder: str = None) -> str:
     p = urlparse(raw_url)
     netloc = re.sub(r'[:]', '_', p.netloc)
     path = p.path or '/'
@@ -69,8 +64,11 @@ def make_local_path(root: str, raw_url: str, snapshot_idx: int = 0) -> str:
         h = hashlib.sha1(p.query.encode('utf-8')).hexdigest()[:8]
         base, ext = os.path.splitext(path)
         path = f"{base}__q{h}{ext or ''}"
-    # place under snapshot folder
-    local = os.path.join(root, f"snapshot_{snapshot_idx}", netloc, path)
+    parts = [root, f"snapshot_{snapshot_idx}", netloc]
+    if subfolder:
+        parts.append(subfolder)
+    parts.append(path)
+    local = os.path.join(*parts)
     return local
 
 def ensure_parent(path: str):
@@ -85,10 +83,8 @@ def normalize_url(base: str, link: str):
     if not link:
         return None
     link = link.strip()
-    # ignore javascript:, mailto:, tel:, data:
     if re.match(r'^(javascript:|mailto:|tel:|data:)', link, re.I):
         return None
-    # remove fragments
     try:
         joined = urljoin(base, link)
         joined = urldefrag(joined)[0]
@@ -105,389 +101,478 @@ def same_host(base: str, url: str):
         return False
 
 def ensure_playwright_browsers():
-    """
-    Ensure Playwright browsers are installed. Prefer doing this at build time,
-    but if not installed, try to run: python -m playwright install chromium
-    """
     global sync_playwright
     if sync_playwright is None:
         try:
-            # Try import again
             from playwright.sync_api import sync_playwright as sp, TimeoutError as PlaywrightTimeoutLocal
             sync_playwright = sp
         except Exception:
             pass
-
     if sync_playwright is None:
         return False, "playwright package not installed. pip install -r requirements.txt"
-
-    # Test launching
     try:
-        with PLAYWRIGHT_LOCK:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            browser.close()
+        return True, None
+    except Exception as e:
+        try:
+            subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=False)
             with sync_playwright() as p:
                 browser = p.chromium.launch(headless=True)
                 browser.close()
-        return True, None
-    except Exception as e:
-        # Try install
-        try:
-            subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=False)
-            with PLAYWRIGHT_LOCK:
-                with sync_playwright() as p:
-                    browser = p.chromium.launch(headless=True)
-                    browser.close()
             return True, None
         except Exception as ex2:
             return False, f"Playwright browser launch failed: {ex2} (original: {e})"
 
-# Background mirror worker using Playwright sync API
-def run_mirror_job(jobid: str, url: str):
-    with JOBS_LOCK:
-        job = JOBS.get(jobid)
-    if job is None:
-        return
-
-    job['logs'].append(f"Starting mirror job for: {url}")
-    tmpdir = tempfile.mkdtemp(prefix='ghost_clone_')
-    job['tmpdir'] = tmpdir
-    job['status'] = 'running'
-    job['started_at'] = time.time()
-
-    ok, msg = ensure_playwright_browsers()
-    if not ok:
-        job['logs'].append("ERROR: Playwright/browser not available: " + (msg or "unknown"))
-        job['status'] = 'error'
-        job['finished_at'] = time.time()
-        return
-
-    # parameters
-    advanced = job.get('advanced', False)
-    max_pages = int(job.get('max_pages', 50) or 50)
-    snapshots = int(job.get('snapshots', 1) or 1)
-    same_host_only = bool(job.get('same_host_only', True))
-    follow_buttons = bool(job.get('follow_buttons', False))
-    per_page_timeout = int(job.get('per_page_timeout', 30) or 30)
-
-    job['logs'].append(f"Options: advanced={advanced}, max_pages={max_pages}, snapshots={snapshots}, same_host_only={same_host_only}, follow_buttons={follow_buttons}")
-
+# Worker function creating its own sync_playwright/browser
+def worker_func(jobid, url_queue, visited_set, visited_lock, job_opts, tmpdir, snapshot_idx, job_ref, stop_event):
     try:
-        with PLAYWRIGHT_LOCK:
-            with sync_playwright() as p:
-                browser = p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-dev-shm-usage'])
-                context = browser.new_context(ignore_https_errors=True)
-                # set default extra headers if needed
+        with sync_playwright() as p:
+            mobile_device = p.devices.get('iPhone 12') or p.devices.get('iPhone 11') or {}
+            browser = p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-dev-shm-usage'])
+            desktop_ctx = browser.new_context(ignore_https_errors=True)
+            try:
+                mobile_ctx = browser.new_context(ignore_https_errors=True, **mobile_device)
+            except Exception:
+                mobile_ctx = browser.new_context(ignore_https_errors=True)
+            try:
+                desktop_ctx.set_extra_http_headers(HEADERS)
+            except Exception:
+                pass
+            try:
+                mobile_ctx.set_extra_http_headers(HEADERS)
+            except Exception:
+                pass
+
+            while not stop_event.is_set():
                 try:
-                    context.set_extra_http_headers(HEADERS)
-                except Exception:
-                    pass
+                    cur, depth = url_queue.get(timeout=2)
+                except queue.Empty:
+                    break
 
-                # For basic mode (existing behavior): just load landing page and save resources once
-                if not advanced:
-                    page = context.new_page()
-                    job['logs'].append("Browser launched. Attaching response handler...")
+                # runtime/resource caps
+                if job_opts['max_runtime'] and job_opts['max_runtime'] > 0:
+                    if time.time() - job_opts['job_start_time'] > job_opts['max_runtime']:
+                        with JOBS_LOCK:
+                            job_ref['logs'].append("Worker: job max runtime reached.")
+                        url_queue.task_done()
+                        break
+                if job_opts['max_resources'] and job_opts['max_resources'] > 0 and job_ref.get('saved_count',0) >= job_opts['max_resources']:
+                    with JOBS_LOCK:
+                        job_ref['logs'].append("Worker: resource cap reached.")
+                    url_queue.task_done()
+                    break
 
-                    def handle_response_simple(response):
+                with JOBS_LOCK:
+                    job_ref['logs'].append(f"[worker] Processing {cur} (depth={depth})")
+
+                rp = job_opts.get('robots_parser')
+                if rp:
+                    try:
+                        ua = HEADERS.get('User-Agent','*')
+                        if not rp.can_fetch(ua, cur):
+                            with JOBS_LOCK:
+                                job_ref['logs'].append(f"[worker] robots.txt disallows {cur}; skipping.")
+                            url_queue.task_done()
+                            continue
+                    except Exception:
+                        pass
+
+                discovered_links = set()
+                discovered_endpoints = set()
+
+                for label, ctx in (('desktop', desktop_ctx), ('mobile', mobile_ctx)):
+                    try:
+                        page = ctx.new_page()
+                    except Exception as e:
+                        with JOBS_LOCK:
+                            job_ref['logs'].append(f"[{label}] open page failed: {e}")
+                        continue
+
+                    def handle_resp(resp):
                         try:
-                            rurl = response.url
+                            rurl = resp.url
                             if not isinstance(rurl, str) or not rurl.startswith('http'):
                                 return
                             try:
-                                body = response.body()
+                                body = resp.body()
                             except Exception:
                                 return
                             if not body:
                                 return
-                            local = make_local_path(tmpdir, rurl, snapshot_idx=0)
+                            headers = resp.headers or {}
+                            local = make_local_path(tmpdir, rurl, snapshot_idx=snapshot_idx, subfolder='assets')
                             ensure_parent(local)
                             if os.path.splitext(local)[1] == '':
-                                ctype = response.headers.get('content-type', '')
-                                ext = ext_from_content_type(ctype)
+                                ext = ext_from_content_type(headers.get('content-type',''))
                                 if ext:
                                     local += ext
+                            # avoid duplicate identical file
+                            if os.path.exists(local) and os.path.getsize(local) == len(body):
+                                return
                             with open(local, 'wb') as fh:
                                 fh.write(body)
-                            job['saved_count'] += 1
-                            job['logs'].append(f"Saved resource: {rurl} -> {os.path.relpath(local, tmpdir)}")
+                            rel = os.path.relpath(local, tmpdir).replace(os.sep, '/')
+                            with JOBS_LOCK:
+                                job_ref['saved_count'] = job_ref.get('saved_count',0) + 1
+                                job_ref['logs'].append(f"[{label}] Saved: {rurl} -> {rel}")
+                                job_ref.setdefault('url_to_local', {})[rurl] = rel
                         except Exception as e:
-                            job['logs'].append(f"Warn: failed saving response {getattr(response,'url', 'unknown')}: {e}")
+                            with JOBS_LOCK:
+                                job_ref['logs'].append(f"[{label}] resp save error: {e}")
 
-                    page.on("response", handle_response_simple)
-                    try:
-                        page.goto(url, timeout=per_page_timeout * 1000, wait_until="domcontentloaded")
-                        job['logs'].append("DOM content loaded.")
-                    except PlaywrightTimeout:
-                        job['logs'].append("Note: page.goto timed out; continuing.")
-                    except Exception as e:
-                        job['logs'].append(f"Note: page.goto error: {e}")
-                    page.wait_for_timeout(2000)
-                    # Save main HTML
-                    try:
-                        html = page.content()
-                        index_path = os.path.join(tmpdir, urlparse(url).netloc, 'index.html')
-                        ensure_parent(index_path)
-                        with open(index_path, 'w', encoding='utf-8') as fh:
-                            fh.write(html)
-                        job['logs'].append(f"Saved main HTML: {os.path.relpath(index_path, tmpdir)}")
-                    except Exception as e:
-                        job['logs'].append(f"Warn: could not save main HTML: {e}")
-                        html = ''
-                    # screenshot
-                    try:
-                        shot_path = os.path.join(tmpdir, 'screenshot.png')
-                        page.screenshot(path=shot_path, full_page=False)
-                        job['screenshot'] = shot_path
-                        job['logs'].append("Saved screenshot.")
-                    except Exception as e:
-                        job['logs'].append(f"Warn: screenshot failed: {e}")
-                    page.close()
-                else:
-                    # Advanced crawling mode
-                    job['logs'].append("Advanced crawling enabled. Starting BFS crawl(s).")
-                    # We'll perform 'snapshots' separate crawl runs. Each snapshot gets its own folder.
-                    total_saved = 0
-                    for sidx in range(snapshots):
-                        job['logs'].append(f"Snapshot {sidx+1}/{snapshots} starting...")
-                        # Use a fresh context for each snapshot to avoid cross-contamination
+                    page.on("response", handle_resp)
+
+                    def handle_req(req):
                         try:
-                            scontext = browser.new_context(ignore_https_errors=True)
-                            scontext.set_extra_http_headers(HEADERS)
-                        except Exception:
-                            scontext = context
-                        page = scontext.new_page()
-                        # response handler for this snapshot
-                        def make_handle_response(snapshot_index):
-                            def handle_response(response):
-                                try:
-                                    rurl = response.url
-                                    if not isinstance(rurl, str) or not rurl.startswith('http'):
-                                        return
-                                    try:
-                                        body = response.body()
-                                    except Exception:
-                                        return
-                                    if not body:
-                                        return
-                                    local = make_local_path(tmpdir, rurl, snapshot_idx=snapshot_index)
-                                    ensure_parent(local)
-                                    if os.path.splitext(local)[1] == '':
-                                        ctype = response.headers.get('content-type', '')
-                                        ext = ext_from_content_type(ctype)
-                                        if ext:
-                                            local += ext
-                                    # Avoid re-writing identical file content repeatedly; use hashing
-                                    if os.path.exists(local):
-                                        # quick size check
-                                        if os.path.getsize(local) == len(body):
-                                            return
-                                    with open(local, 'wb') as fh:
-                                        fh.write(body)
-                                    job['saved_count'] += 1
-                                    job['logs'].append(f"[S{sidx+1}] Saved resource: {rurl} -> {os.path.relpath(local, tmpdir)}")
-                                except Exception as e:
-                                    job['logs'].append(f"Warn: failed saving response {getattr(response,'url', 'unknown')}: {e}")
-                            return handle_response
-
-                        page.on("response", make_handle_response(sidx))
-
-                        # BFS queue
-                        q = deque()
-                        visited = set()
-                        q.append(url)
-                        visited.add(url)
-                        pages_crawled = 0
-
-                        while q and pages_crawled < max_pages:
-                            cur = q.popleft()
-                            job['logs'].append(f"[S{sidx+1}] Crawling: {cur} (queued: {len(q)})")
-                            try:
-                                page.goto(cur, timeout=per_page_timeout * 1000, wait_until="domcontentloaded")
-                            except PlaywrightTimeout:
-                                job['logs'].append(f"[S{sidx+1}] Note: goto timeout for {cur}")
-                            except Exception as e:
-                                job['logs'].append(f"[S{sidx+1}] goto error for {cur}: {e}")
-                            # small wait for XHR/fetch
-                            page.wait_for_timeout(1000 + (sidx * 200))
-                            # try to extract links from DOM
-                            try:
-                                # evaluate in page: return arrays of hrefs, srcs, forms, onclicks
-                                data = page.evaluate("""() => {
-                                    const out = {links: [], imgs: [], forms: [], onclicks: []};
-                                    try {
-                                        Array.from(document.querySelectorAll('a[href]')).forEach(a => out.links.push(a.getAttribute('href')));
-                                        Array.from(document.querySelectorAll('area[href]')).forEach(a => out.links.push(a.getAttribute('href')));
-                                        Array.from(document.querySelectorAll('img[src]')).forEach(i => out.imgs.push(i.getAttribute('src')));
-                                        Array.from(document.querySelectorAll('link[href]')).forEach(l => out.links.push(l.getAttribute('href')));
-                                        Array.from(document.querySelectorAll('script[src]')).forEach(s => out.links.push(s.getAttribute('src')));
-                                        Array.from(document.querySelectorAll('form[action]')).forEach(f => out.forms.push(f.getAttribute('action')));
-                                        Array.from(document.querySelectorAll('[onclick]')).forEach(e => out.onclicks.push(e.getAttribute('onclick') || ''));
-                                        // buttons with data-href or aria-role link
-                                        Array.from(document.querySelectorAll('button[data-href]')).forEach(b => out.links.push(b.getAttribute('data-href')));
-                                        Array.from(document.querySelectorAll('[role=\"link\"][data-href]')).forEach(b => out.links.push(b.getAttribute('data-href')));
-                                    } catch (e) {}
-                                    return out;
-                                }""")
-                            except Exception as e:
-                                job['logs'].append(f"[S{sidx+1}] DOM eval failed for {cur}: {e}")
-                                data = {'links': [], 'imgs': [], 'forms': [], 'onclicks': []}
-
-                            # get page HTML and save it
-                            try:
-                                html = page.content()
-                                # save under snapshot_dir/netloc/path
-                                parsed = urlparse(cur)
-                                index_path = os.path.join(tmpdir, f"snapshot_{sidx}", parsed.netloc, (parsed.path.lstrip('/') or 'index.html'))
-                                if index_path.endswith('/'):
-                                    index_path = index_path + 'index.html'
-                                if index_path.endswith('/'):
-                                    index_path = index_path + 'index.html'
-                                # ensure file ends with .html
-                                if not os.path.splitext(index_path)[1]:
-                                    index_path = index_path + '.html'
-                                ensure_parent(index_path)
-                                with open(index_path, 'w', encoding='utf-8') as fh:
-                                    fh.write(html)
-                                job['logs'].append(f"[S{sidx+1}] Saved HTML: {os.path.relpath(index_path, tmpdir)}")
-                            except Exception as e:
-                                job['logs'].append(f"[S{sidx+1}] Could not save HTML for {cur}: {e}")
-
-                            # heuristic: from onclick attributes, try to extract URL patterns
-                            extra_links = []
-                            for oc in data.get('onclicks', []) or []:
-                                # simplistic regex looking for location.href='...'
-                                if not oc:
-                                    continue
-                                m = re.search(r'(?:location|window\.location|location\.href)\s*=\s*[\'"](.*?)[\'"]', oc)
-                                if m:
-                                    extra_links.append(m.group(1))
-                                m2 = re.search(r'open\(\s*[\'"](.*?)[\'"]', oc)
-                                if m2:
-                                    extra_links.append(m2.group(1))
-                            # combine discovered links
-                            discovered = []
-                            for L in (data.get('links') or []) + (data.get('imgs') or []) + (data.get('forms') or []) + extra_links:
-                                if not L:
-                                    continue
-                                n = normalize_url(cur, L)
-                                if n:
-                                    # optionally ignore non-http
-                                    if not n.startswith('http'):
-                                        continue
-                                    if same_host_only and not same_host(url, n):
-                                        continue
-                                    if n not in visited:
-                                        discovered.append(n)
-                            # enqueue discovered links
-                            for n in discovered:
-                                if len(visited) >= max_pages:
-                                    break
-                                if n not in visited:
-                                    visited.add(n)
-                                    q.append(n)
-
-                            pages_crawled += 1
-
-                        # After snapshot crawl, take a screenshot of the landing page if possible
-                        try:
-                            dest_shot = os.path.join(tmpdir, f"screenshot_snapshot_{sidx+1}.png")
-                            page.screenshot(path=dest_shot, full_page=False)
-                            # keep last snapshot's screenshot as job['screenshot']
-                            job['screenshot'] = dest_shot
-                            job['logs'].append(f"[S{sidx+1}] Screenshot saved.")
-                        except Exception as e:
-                            job['logs'].append(f"[S{sidx+1}] Screenshot failed: {e}")
-                        # close page and context if we created new
-                        try:
-                            page.close()
+                            ru = req.url
+                            if isinstance(ru,str) and ru.startswith('http'):
+                                rt = req.resource_type
+                                if rt in ('xhr','fetch','document','script'):
+                                    discovered_endpoints.add(ru)
                         except Exception:
                             pass
-                        if scontext is not context:
+                    page.on("request", handle_req)
+
+                    try:
+                        page.goto(cur, timeout=job_opts['per_page_timeout']*1000, wait_until="domcontentloaded")
+                    except PlaywrightTimeout:
+                        with JOBS_LOCK:
+                            job_ref['logs'].append(f"[{label}] timeout loading {cur}")
+                    except Exception as e:
+                        with JOBS_LOCK:
+                            job_ref['logs'].append(f"[{label}] error loading {cur}: {e}")
+
+                    try:
+                        page.wait_for_timeout(800)
+                    except Exception:
+                        pass
+
+                    if job_opts['follow_buttons']:
+                        try:
+                            elems = page.query_selector_all('button[data-href], [role="link"][data-href], a[data-auto-click]')
+                            for e in elems[:5]:
+                                try:
+                                    dh = e.get_attribute('data-href')
+                                    if dh:
+                                        target = normalize_url(cur, dh)
+                                        if target:
+                                            discovered_links.add(target)
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+
+                    try:
+                        html = page.content()
+                    except Exception:
+                        html = ''
+
+                    try:
+                        parsed = urlparse(cur)
+                        relpath = parsed.path.lstrip('/') or 'index.html'
+                        if relpath.endswith('/'):
+                            relpath = relpath + 'index.html'
+                        if not os.path.splitext(relpath)[1]:
+                            relpath = relpath + '.html'
+                        local_html = os.path.join(tmpdir, f"snapshot_{snapshot_idx}", parsed.netloc, relpath)
+                        ensure_parent(local_html)
+                        with open(local_html, 'w', encoding='utf-8') as fh:
+                            fh.write(html)
+                        rel = os.path.relpath(local_html, tmpdir).replace(os.sep, '/')
+                        with JOBS_LOCK:
+                            job_ref['logs'].append(f"[{label}] Saved HTML: {rel}")
+                            job_ref.setdefault('url_to_local', {})[cur] = rel
+                    except Exception as e:
+                        with JOBS_LOCK:
+                            job_ref['logs'].append(f"[{label}] html save warn: {e}")
+
+                    if job_opts['auto_snapshot']:
+                        try:
+                            shot_name = os.path.join(tmpdir, f"screenshot_snapshot_{snapshot_idx}_{label}.png")
+                            page.screenshot(path=shot_name, full_page=False)
+                            with JOBS_LOCK:
+                                job_ref['screenshot'] = shot_name
+                                job_ref['logs'].append(f"[{label}] screenshot saved: {os.path.relpath(shot_name, tmpdir)}")
+                        except Exception as e:
+                            with JOBS_LOCK:
+                                job_ref['logs'].append(f"[{label}] screenshot failed: {e}")
+
+                    try:
+                        data = page.evaluate("""() => {
+                            const out = {links: [], imgs: [], forms: [], onclicks: [], scripts: []};
+                            try {
+                                Array.from(document.querySelectorAll('a[href]')).forEach(a => out.links.push(a.getAttribute('href')));
+                                Array.from(document.querySelectorAll('img[src]')).forEach(i => out.imgs.push(i.getAttribute('src')));
+                                Array.from(document.querySelectorAll('link[href]')).forEach(l => out.links.push(l.getAttribute('href')));
+                                Array.from(document.querySelectorAll('script[src]')).forEach(s => out.scripts.push(s.getAttribute('src')));
+                                Array.from(document.querySelectorAll('script:not([src])')).forEach(s => out.scripts.push(s.textContent || ''));
+                                Array.from(document.querySelectorAll('form[action]')).forEach(f => out.forms.push(f.getAttribute('action')));
+                                Array.from(document.querySelectorAll('[onclick]')).forEach(e => out.onclicks.push(e.getAttribute('onclick') || ''));
+                            } catch (e) {}
+                            return out;
+                        }""")
+                    except Exception:
+                        data = {'links': [], 'imgs': [], 'forms': [], 'onclicks': [], 'scripts': []}
+
+                    for L in (data.get('links') or []) + (data.get('imgs') or []) + (data.get('forms') or []):
+                        if not L:
+                            continue
+                        n = normalize_url(cur, L)
+                        if n and n.startswith('http'):
+                            if job_opts['same_host_only'] and not same_host(job_opts['start_url'], n):
+                                continue
+                            discovered_links.add(n)
+
+                    for oc in (data.get('onclicks') or []):
+                        if not oc:
+                            continue
+                        m = re.search(r'(?:location|window\.location|location\.href)\s*=\s*[\'"](.*?)[\'"]', oc)
+                        if m:
+                            candidate = normalize_url(cur, m.group(1))
+                            if candidate:
+                                discovered_links.add(candidate)
+                        m2 = re.search(r'open\(\s*[\'"](.*?)[\'"]', oc)
+                        if m2:
+                            candidate = normalize_url(cur, m2.group(1))
+                            if candidate:
+                                discovered_links.add(candidate)
+
+                    for st in (data.get('scripts') or []):
+                        if not st:
+                            continue
+                        for m in re.finditer(r'(https?://[\\w\\-\\.\\/:?&=#%]+)', st):
+                            discovered_endpoints.add(m.group(1))
+                        for m in re.finditer(r'([\\'\\"])(/[^\\'\\"]*?/api/[^\\'\\"]*)([\\'\\"])', st, flags=re.I):
+                            candidate = m.group(2)
+                            candidate_abs = normalize_url(cur, candidate)
+                            if candidate_abs:
+                                discovered_endpoints.add(candidate_abs)
+
+                    with visited_lock:
+                        if discovered_endpoints:
+                            job_ref.setdefault('endpoints', set()).update(discovered_endpoints)
+                        for n in discovered_links:
+                            if n in visited_set:
+                                continue
+                            if job_opts['depth_limit'] and job_opts['depth_limit'] > 0 and depth+1 > job_opts['depth_limit']:
+                                continue
+                            visited_set.add(n)
                             try:
-                                scontext.close()
+                                url_queue.put((n, depth+1))
                             except Exception:
                                 pass
-                        job['logs'].append(f"Snapshot {sidx+1} finished. Crawled up to {pages_crawled} pages.")
-                        total_saved = job['saved_count']
 
-                    job['logs'].append(f"Advanced crawling finished. Total resources saved: {total_saved}")
-                    browser.close()
-
-        # After browser closed (or after simple mode), attempt to rewrite HTMLs to local references
-        try:
-            # Build map of original URL -> local relpath across snapshots
-            url_to_local = {}
-            for root_dir, _, files in os.walk(tmpdir):
-                for fn in files:
-                    full = os.path.join(root_dir, fn)
-                    rel = os.path.relpath(full, tmpdir).replace(os.sep, '/')
-                    # attempt to reverse map: snapshot_X/netloc/path => https://netloc/path
-                    parts = rel.split('/', 2)
-                    if len(parts) >= 3 and parts[0].startswith('snapshot_'):
-                        _, netloc, pth = parts[0], parts[1], parts[2]
-                        possible_url = f"https://{netloc}/{pth}"
-                        url_to_local[possible_url] = rel
-                        # also store without https prefix (http)
-                        possible_url2 = f"http://{netloc}/{pth}"
-                        url_to_local[possible_url2] = rel
-                    # also map root files (non-snapshot) if any
-                    elif len(parts) >= 2:
-                        netloc = parts[0]
-                        pth = '/'.join(parts[1:])
-                        possible_url = f"https://{netloc}/{pth}"
-                        url_to_local[possible_url] = rel
-                        url_to_local[f"http://{netloc}/{pth}"] = rel
-
-            # Walk HTML files and rewrite references
-            for root_dir, _, files in os.walk(tmpdir):
-                for fn in files:
-                    if not fn.lower().endswith(('.html', '.htm')):
-                        continue
-                    full = os.path.join(root_dir, fn)
                     try:
-                        with open(full, 'r', encoding='utf-8') as fh:
-                            html = fh.read()
-                        base_url = None
-                        # try to determine original base from path: /snapshot_X/netloc/...
-                        rel = os.path.relpath(full, tmpdir).replace(os.sep, '/')
-                        m = re.match(r'(snapshot_\d+)\/([^\/]+)\/(.*)', rel)
-                        if m:
-                            netloc = m.group(2)
-                            base_url = f"https://{netloc}/"
-                        else:
-                            # fallback: use job url
-                            base_url = url
-                        # replace src/href/action/poster values
-                        def repl_attr(m):
-                            prefix = m.group(1)
-                            orig = m.group(2)
-                            quote = m.group(3)
-                            abs_url = normalize_url(base_url, orig) or orig
-                            local = url_to_local.get(abs_url)
-                            if local:
-                                return prefix + local + quote
-                            # if relative local file exists, keep as-is
-                            return prefix + orig + quote
-                        new_html = re.sub(r'(\b(?:src|href|poster|action)\s*=\s*["\'])(.*?)(["\'])', repl_attr, html, flags=re.I)
-                        # rewrite CSS url(...) occurrences
-                        def repl_css(m):
-                            prefix = m.group(1)
-                            orig = m.group(2)
-                            abs_url = normalize_url(base_url, orig) or orig
-                            local = url_to_local.get(abs_url)
-                            if local:
-                                return 'url(' + local + ')'
-                            return 'url(' + orig + ')'
-                        new_html = re.sub(r'(?i)(url\(["\']?)(.*?)["\']?\)', repl_css, new_html)
-                        # write back
-                        with open(full, 'w', encoding='utf-8') as fh:
-                            fh.write(new_html)
-                        job['logs'].append(f"Rewrote HTML links in {os.path.relpath(full, tmpdir)}")
-                    except Exception as e:
-                        job['logs'].append(f"Warn: rewriting {full} failed: {e}")
-        except Exception as e:
-            job['logs'].append(f"Warn: rewriting HTMLs failed: {e}")
+                        page.close()
+                    except Exception:
+                        pass
 
-        # Package into ZIP
-        job['logs'].append("Packaging files into ZIP...")
+                url_queue.task_done()
+
+            try:
+                desktop_ctx.close()
+            except Exception:
+                pass
+            try:
+                mobile_ctx.close()
+            except Exception:
+                pass
+            try:
+                browser.close()
+            except Exception:
+                pass
+    except Exception as e:
+        with JOBS_LOCK:
+            job_ref['logs'].append("Worker encountered error: " + str(e))
+            job_ref['logs'].append(traceback.format_exc())
+
+# Main runner
+def run_mirror_job(jobid: str, start_url: str):
+    with JOBS_LOCK:
+        job = JOBS.get(jobid)
+    if not job:
+        return
+
+    job['logs'].append(f"Job {jobid} starting for {start_url}")
+    job['status'] = 'running'
+    job['started_at'] = time.time()
+    tmpdir = tempfile.mkdtemp(prefix='ghost_clone_')
+    job['tmpdir'] = tmpdir
+
+    ok, msg = ensure_playwright_browsers()
+    if not ok:
+        job['logs'].append("ERROR: Playwright/browser missing: " + (msg or "unknown"))
+        job['status'] = 'error'
+        job['finished_at'] = time.time()
+        return
+
+    advanced = job.get('advanced', True)
+    obey_robots = job.get('obey_robots', False)
+    concurrency = max(1, int(job.get('concurrency', 1) or 1))
+    crawl_mode = job.get('crawl_mode', 'bfs')
+    depth_limit = int(job.get('depth_limit', 0) or 0)
+    no_page_limit = job.get('no_page_limit', True)
+    max_pages = None if no_page_limit else int(job.get('max_pages', 100) or 100)
+    snapshots = int(job.get('snapshots', 1) or 1)
+    same_host_only = bool(job.get('same_host_only', True))
+    follow_buttons = bool(job.get('follow_buttons', True))
+    per_page_timeout = int(job.get('per_page_timeout', 30) or 30)
+    capture_api = bool(job.get('capture_api', True))
+    max_runtime = int(job.get('max_runtime', 0) or 0)
+    max_resources = int(job.get('max_resources', 0) or 0)
+    auto_snapshot = bool(job.get('auto_snapshot', True))
+    auto_clone_all = True
+
+    job_opts_template = {
+        'start_url': start_url,
+        'follow_buttons': follow_buttons,
+        'per_page_timeout': per_page_timeout,
+        'same_host_only': same_host_only,
+        'capture_api': capture_api,
+        'max_runtime': max_runtime,
+        'max_resources': max_resources,
+        'auto_snapshot': auto_snapshot,
+        'depth_limit': depth_limit,
+    }
+
+    rp = None
+    if obey_robots:
+        try:
+            parsed = urlparse(start_url)
+            robots_url = f"{parsed.scheme}://{parsed.netloc}/robots.txt"
+            rp = urllib.robotparser.RobotFileParser()
+            rp.set_url(robots_url)
+            rp.read()
+            job['logs'].append(f"Loaded robots.txt from {robots_url}")
+        except Exception as e:
+            job['logs'].append(f"robots.txt load failed: {e}")
+            rp = None
+
+    try:
+        for sidx in range(snapshots):
+            job['logs'].append(f"Snapshot {sidx+1}/{snapshots} starting")
+            url_q = queue.Queue()
+            visited = set()
+            visited_lock = threading.Lock()
+            visited.add(start_url)
+            url_q.put((start_url, 0))
+
+            job['endpoints'] = set()
+            job['url_to_local'] = job.get('url_to_local', {})
+            job['saved_count'] = job.get('saved_count', 0)
+
+            job_opts = job_opts_template.copy()
+            job_opts['robots_parser'] = rp
+            job_opts['follow_buttons'] = follow_buttons
+            job_opts['start_url'] = start_url
+            job_opts['auto_snapshot'] = auto_snapshot
+            job_opts['depth_limit'] = depth_limit
+            job_opts['per_page_timeout'] = per_page_timeout
+            job_opts['max_runtime'] = max_runtime
+            job_opts['max_resources'] = max_resources
+            job_opts['job_start_time'] = time.time()
+            job_opts['max_pages'] = max_pages
+
+            stop_event = threading.Event()
+            workers = []
+            for i in range(concurrency):
+                t = threading.Thread(target=worker_func, args=(jobid, url_q, visited, visited_lock, job_opts, tmpdir, sidx, job, stop_event), daemon=True)
+                t.start()
+                workers.append(t)
+
+            try:
+                while True:
+                    if url_q.empty():
+                        all_dead = all(not t.is_alive() for t in workers)
+                        if all_dead:
+                            break
+                    if max_runtime and (time.time() - job_opts['job_start_time'] > max_runtime):
+                        job['logs'].append("Snapshot runtime cap reached; stopping workers.")
+                        stop_event.set()
+                        break
+                    if max_resources and max_resources > 0 and job.get('saved_count',0) >= max_resources:
+                        job['logs'].append("Snapshot resource cap reached; stopping workers.")
+                        stop_event.set()
+                        break
+                    if max_pages is not None and not auto_clone_all:
+                        if len(visited) >= max_pages:
+                            job['logs'].append("Configured max_pages reached; stopping workers.")
+                            stop_event.set()
+                            break
+                    time.sleep(1)
+            finally:
+                stop_event.set()
+                try:
+                    while not url_q.empty():
+                        url_q.get_nowait()
+                        url_q.task_done()
+                except Exception:
+                    pass
+                for t in workers:
+                    t.join(timeout=5)
+
+            job['logs'].append(f"Snapshot {sidx+1} finished. Saved: {job.get('saved_count',0)}")
+
+        job['logs'].append("Rewriting HTML to point to local assets where possible...")
+        url_to_local = job.get('url_to_local', {}) or {}
+        for root_dir, _, files in os.walk(tmpdir):
+            for fn in files:
+                full = os.path.join(root_dir, fn)
+                rel = os.path.relpath(full, tmpdir).replace(os.sep, '/')
+                parts = rel.split('/', 2)
+                if len(parts) >= 3 and parts[0].startswith('snapshot_'):
+                    _, netloc, rest = parts[0], parts[1], parts[2]
+                    possible_url = f"https://{netloc}/{rest}"
+                    url_to_local.setdefault(possible_url, rel)
+                    url_to_local.setdefault(f"http://{netloc}/{rest}", rel)
+                elif len(parts) >= 2:
+                    netloc = parts[0]
+                    rest = '/'.join(parts[1:])
+                    url_to_local.setdefault(f"https://{netloc}/{rest}", rel)
+                    url_to_local.setdefault(f"http://{netloc}/{rest}", rel)
+
+        for root_dir, _, files in os.walk(tmpdir):
+            for fn in files:
+                if not fn.lower().endswith(('.html', '.htm')):
+                    continue
+                full = os.path.join(root_dir, fn)
+                try:
+                    with open(full, 'r', encoding='utf-8') as fh:
+                        html = fh.read()
+                    base_url = start_url
+                    rel = os.path.relpath(full, tmpdir).replace(os.sep, '/')
+                    m = re.match(r'(snapshot_\d+)\/([^\/]+)\/(.*)', rel)
+                    if m:
+                        netloc = m.group(2)
+                        base_url = f"https://{netloc}/"
+                    def repl_attr(m):
+                        prefix = m.group(1)
+                        orig = m.group(2)
+                        quote = m.group(3)
+                        abs_url = normalize_url(base_url, orig) or orig
+                        local = url_to_local.get(abs_url)
+                        if local:
+                            return prefix + local + quote
+                        return prefix + orig + quote
+                    new_html = re.sub(r'(\b(?:src|href|poster|action)\s*=\s*["\'])(.*?)(["\'])', repl_attr, html, flags=re.I)
+                    def repl_css(m):
+                        prefix = m.group(1)
+                        orig = m.group(2)
+                        abs_url = normalize_url(base_url, orig) or orig
+                        local = url_to_local.get(abs_url)
+                        if local:
+                            return 'url(' + local + ')'
+                        return 'url(' + orig + ')'
+                    new_html = re.sub(r'(?i)(url\(["\']?)(.*?)["\']?\)', repl_css, new_html)
+                    with open(full, 'w', encoding='utf-8') as fh:
+                        fh.write(new_html)
+                    job['logs'].append(f"Rewrote {os.path.relpath(full, tmpdir)}")
+                except Exception as e:
+                    job['logs'].append(f"Warn rewrite {full}: {e}")
+
+        job['logs'].append("Packaging into ZIP...")
         zip_io = io.BytesIO()
         with zipfile.ZipFile(zip_io, 'w', compression=zipfile.ZIP_DEFLATED) as zf:
             for root_dir, _, files in os.walk(tmpdir):
@@ -499,25 +584,22 @@ def run_mirror_job(jobid: str, url: str):
         job['zip_bytes'] = zip_io.read()
         job['status'] = 'done'
         job['finished_at'] = time.time()
-        job['logs'].append("ZIP ready. Job finished successfully.")
+        job['logs'].append("Job completed successfully.")
     except Exception as exc:
         tb = traceback.format_exc()
         job['logs'].append("ERROR during mirroring:")
         job['logs'].append(tb)
         job['status'] = 'error'
         job['finished_at'] = time.time()
-    finally:
-        # leave tmpdir for a bit; cleanup thread will remove it
-        pass
 
-# Cleanup thread to remove old job artifacts
+# Cleanup thread
 def cleanup_worker():
     while True:
         now = time.time()
         with JOBS_LOCK:
             to_delete = []
             for jid, j in list(JOBS.items()):
-                if j.get('status') in ('done', 'error') and j.get('finished_at'):
+                if j.get('status') in ('done','error') and j.get('finished_at'):
                     if now - j['finished_at'] > CLEANUP_SECONDS:
                         to_delete.append(jid)
             for jid in to_delete:
@@ -533,177 +615,148 @@ def cleanup_worker():
 cleanup_thread = threading.Thread(target=cleanup_worker, daemon=True)
 cleanup_thread.start()
 
-# HTML UI (extended with advanced options)
+# UI template (simplified but functional)
 INDEX_HTML = """
 <!doctype html>
 <html>
-<head>
-  <meta charset="utf-8">
-  <title>Ghost Advance — Playwright Cloner</title>
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <style>
-    :root{--card:#0b1220;--muted:#94a3b8;--accent:#06b6d4;--glass:rgba(255,255,255,0.03)}
-    body{margin:0;font-family:Inter,system-ui,Segoe UI,Arial;background:linear-gradient(180deg,#071024 0%, #071530 100%);color:#e6eef6}
-    .wrap{max-width:980px;margin:28px auto;padding:20px}
-    h1{margin:0;font-size:20px}
-    .card{background:var(--card);padding:16px;border-radius:12px;box-shadow:0 6px 24px rgba(2,6,23,0.6);margin-top:18px}
-    label{display:block;font-size:13px;color:var(--muted);margin-bottom:6px}
-    input[type=url], input[type=number], input[type=text] {width:100%;padding:10px;border-radius:8px;border:1px solid rgba(255,255,255,0.04);background:var(--glass);color:inherit}
-    button{background:var(--accent);border:none;color:#012;padding:10px 12px;border-radius:8px;cursor:pointer;font-weight:600}
-    .row{display:flex;gap:12px;align-items:center}
-    .logs{height:260px;overflow:auto;background:#021024;border-radius:8px;padding:12px;font-family:monospace;font-size:13px;color:#cfeaff;white-space:pre-wrap}
-    .meta{display:flex;gap:12px;align-items:center;margin-top:12px}
-    .muted{color:var(--muted);font-size:13px}
-    .screenshot{max-width:100%;border-radius:8px;border:1px solid rgba(255,255,255,0.04);margin-top:12px}
-    .actions{display:flex;gap:8px;margin-left:auto}
-    footer{margin-top:18px;color:var(--muted);font-size:12px}
-    .opts{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:12px}
-    .small{font-size:13px;color:var(--muted)}
-  </style>
+<head><meta charset="utf-8"><title>Ghost Advance</title><meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+body{background:#071024;color:#e6eef6;font-family:Inter,Arial;padding:14px}
+.card{background:#0b1220;padding:16px;border-radius:10px;max-width:1000px;margin:0 auto}
+input,select{padding:8px;border-radius:6px;background:rgba(255,255,255,0.02);border:1px solid rgba(255,255,255,0.03);color:inherit}
+button{background:#06b6d4;border:none;color:#012;padding:8px 12px;border-radius:8px;cursor:pointer}
+.logs{height:300px;overflow:auto;background:#021024;padding:12px;border-radius:8px;font-family:monospace}
+.endpoints{max-height:120px;overflow:auto;background:#021024;padding:8px;border-radius:8px}
+.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
+.small{color:#94a3b8;font-size:13px}
+</style>
 </head>
 <body>
-  <div class="wrap">
-    <h1>Ghost Advance — Playwright Website Cloner</h1>
-    <small class="muted">Ephemeral one-shot mirror. No persistent history is stored.</small>
+<div class="card">
+  <h2>Ghost Advance — Render-friendly</h2>
+  <div class="small">Use responsibly. Only crawl sites you own or have permission to crawl.</div>
 
-    <div class="card">
-      <label for="url">Website URL</label>
-      <div class="row">
-        <input id="url" type="url" placeholder="https://example.com/">
-        <div class="actions">
-          <button id="startBtn">Start Cloning</button>
-          <button id="clearBtn">Clear Logs</button>
-        </div>
-      </div>
-
-      <div class="opts">
-        <div>
-          <label><input type="checkbox" id="advanced"> Advanced cloning (follow links, images, pages)</label>
-          <div class="small">When on, the crawler will attempt to discover and save multiple pages. Use with caution.</div>
-        </div>
-        <div>
-          <label for="max_pages">Max pages (advanced)</label>
-          <input id="max_pages" type="number" value="50" min="1" max="1000">
-        </div>
-        <div>
-          <label for="snapshots">Snapshots (repeat crawls)</label>
-          <input id="snapshots" type="number" value="1" min="1" max="10">
-        </div>
-        <div>
-          <label><input type="checkbox" id="same_host" checked> Same-host only</label>
-          <div class="small">Restrict crawling to the initial hostname (recommended)</div>
-        </div>
-        <div>
-          <label><input type="checkbox" id="follow_buttons"> Follow data-href / onclick heuristics</label>
-        </div>
-        <div>
-          <label for="per_page_timeout">Per-page timeout (s)</label>
-          <input id="per_page_timeout" type="number" value="30" min="5" max="120">
-        </div>
-      </div>
-
-      <div class="meta" style="margin-top:12px">
-        <div><span class="muted">Status:</span> <span id="status">idle</span></div>
-        <div id="savedCount" class="muted"></div>
-        <div style="margin-left:auto"><span id="jobLinks"></span></div>
-      </div>
-
-      <div style="margin-top:12px">
-        <div class="logs" id="logs">Logs will appear here...</div>
-      </div>
-
-      <div id="screenshotArea"></div>
-    </div>
-
-    <footer>
-      Tip: For large sites, use dedicated mirroring tools. This snapshot is ephemeral and short-lived.
-    </footer>
+  <div style="margin-top:12px">
+    <label>URL: <input id="url" type="url" placeholder="https://example.com"></label>
   </div>
 
+  <div class="grid" style="margin-top:8px">
+    <label><input id="advanced" type="checkbox" checked> Advanced</label>
+    <label><input id="obey" type="checkbox"> Obey robots.txt</label>
+    <label>Concurrency <input id="concurrency" type="number" value="1" min="1" max="4"></label>
+
+    <label>Crawl mode <select id="crawl_mode"><option value="bfs">BFS</option><option value="dfs">DFS</option></select></label>
+    <label>Depth limit <input id="depth_limit" type="number" value="0" min="0"></label>
+    <label>No page limit <input id="no_page_limit" type="checkbox" checked></label>
+
+    <label>Max pages <input id="max_pages" type="number" value="100" min="1"></label>
+    <label>Snapshots <input id="snapshots" type="number" value="1" min="1" max="5"></label>
+    <label>Same-host only <input id="same_host" type="checkbox" checked></label>
+
+    <label>Follow onclick heuristics <input id="follow_buttons" type="checkbox" checked></label>
+    <label>Capture API <input id="capture_api" type="checkbox" checked></label>
+    <label>Auto snapshot <input id="auto_snapshot" type="checkbox" checked></label>
+
+    <label>Per-page timeout (s) <input id="per_page_timeout" type="number" value="30" min="5"></label>
+    <label>Max runtime (s, 0 unlimited) <input id="max_runtime" type="number" value="0" min="0"></label>
+    <label>Max resources (0 unlimited) <input id="max_resources" type="number" value="0" min="0"></label>
+  </div>
+
+  <div style="margin-top:8px" class="row">
+    <button id="startBtn">Start</button>
+    <button id="clearBtn">Clear</button>
+    <div style="margin-left:auto" id="jobLinks"></div>
+  </div>
+
+  <div style="margin-top:12px" class="logs" id="logs">Logs will appear here...</div>
+
+  <h4 style="margin-top:12px">Discovered endpoints (select and Capture)</h4>
+  <div class="endpoints" id="endpoints">No endpoints yet</div>
+  <div style="margin-top:8px" class="row">
+    <button id="capture_selected">Capture selected endpoints</button>
+    <button id="capture_all">Capture all endpoints</button>
+  </div>
+
+  <div style="margin-top:12px" id="screenshotArea"></div>
+</div>
+
 <script>
-let jobid = null;
-let pollTimer = null;
-
-document.getElementById('startBtn').addEventListener('click', async () => {
+let jobid = null; let pollTimer = null;
+document.getElementById('startBtn').onclick = async () => {
   const url = document.getElementById('url').value.trim();
-  if (!url) { alert('Enter a URL'); return; }
-  startJob(url);
-});
-
-document.getElementById('clearBtn').addEventListener('click', () => {
-  document.getElementById('logs').innerText = '';
-  document.getElementById('screenshotArea').innerHTML = '';
-  document.getElementById('status').innerText = 'idle';
-  jobid = null;
-  if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
-  document.getElementById('jobLinks').innerHTML = '';
-});
-
-async function startJob(url) {
-  document.getElementById('logs').innerText = 'Submitting job...';
+  if (!url) { alert('Enter URL'); return; }
   const payload = {
     url,
     advanced: document.getElementById('advanced').checked,
-    max_pages: Number(document.getElementById('max_pages').value || 50),
+    obey_robots: document.getElementById('obey').checked,
+    concurrency: Number(document.getElementById('concurrency').value || 1),
+    crawl_mode: document.getElementById('crawl_mode').value,
+    depth_limit: Number(document.getElementById('depth_limit').value || 0),
+    no_page_limit: document.getElementById('no_page_limit').checked,
+    max_pages: Number(document.getElementById('max_pages').value || 100),
     snapshots: Number(document.getElementById('snapshots').value || 1),
     same_host_only: document.getElementById('same_host').checked,
     follow_buttons: document.getElementById('follow_buttons').checked,
-    per_page_timeout: Number(document.getElementById('per_page_timeout').value || 30)
+    capture_api: document.getElementById('capture_api').checked,
+    auto_snapshot: document.getElementById('auto_snapshot').checked,
+    per_page_timeout: Number(document.getElementById('per_page_timeout').value || 30),
+    max_runtime: Number(document.getElementById('max_runtime').value || 0),
+    max_resources: Number(document.getElementById('max_resources').value || 0)
   };
-  const res = await fetch('/start', {
-    method: 'POST', headers: {'Content-Type':'application/json'},
-    body: JSON.stringify(payload)
-  });
+  const res = await fetch('/start', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
   const j = await res.json();
-  if (!j.ok) {
-    document.getElementById('logs').innerText = 'Error: ' + (j.error || 'unknown');
-    return;
-  }
-  jobid = j.jobid;
-  document.getElementById('status').innerText = 'processing';
+  if (!j.ok) { alert('Start failed: '+(j.error||'unknown')); return; }
+  jobid = j.jobid; document.getElementById('logs').innerText = '';
+  pollTimer = setInterval(pollStatus, 1200);
+};
+
+document.getElementById('clearBtn').onclick = () => {
   document.getElementById('logs').innerText = '';
-  startPolling();
+  document.getElementById('endpoints').innerHTML = 'No endpoints yet';
+  if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+  jobid = null; document.getElementById('jobLinks').innerHTML = ''; document.getElementById('screenshotArea').innerHTML = '';
+};
+
+async function pollStatus(){
+  if (!jobid) return;
+  try {
+    const [lres, sres, eres] = await Promise.all([fetch('/logs/'+jobid), fetch('/status/'+jobid), fetch('/endpoints/'+jobid)]);
+    const lj = await lres.json(); const sj = await sres.json(); const ej = await eres.json();
+    if (lj.ok) { document.getElementById('logs').innerText = lj.logs.join('\\n'); const el=document.getElementById('logs'); el.scrollTop = el.scrollHeight; }
+    if (sj.ok) {
+      const links = document.getElementById('jobLinks'); links.innerHTML = '';
+      if (sj.status === 'done') { links.innerHTML = `<a href="/download/${jobid}" style="color:#99f">Download ZIP</a>`; document.getElementById('screenshotArea').innerHTML = `<img src="/screenshot/${jobid}" style="max-width:100%;margin-top:8px">`; }
+    }
+    if (ej.ok) {
+      const endpoints = ej.endpoints || []; const container = document.getElementById('endpoints');
+      if (!endpoints.length) { container.innerHTML = 'No endpoints yet'; } else {
+        container.innerHTML = endpoints.map(url => {
+          return `<div><label><input type="checkbox" data-url="${encodeURIComponent(url)}"> ${url}</label></div>`;
+        }).join('');
+      }
+    }
+  } catch(e){ console.error(e); }
 }
 
-function startPolling(){
-  if (pollTimer) clearInterval(pollTimer);
-  pollTimer = setInterval(async ()=>{
-    if (!jobid) return;
-    try {
-      const [lres, sres] = await Promise.all([fetch('/logs/'+jobid), fetch('/status/'+jobid)]);
-      const lj = await lres.json();
-      const sj = await sres.json();
-      if (lj.ok) {
-        document.getElementById('logs').innerText = lj.logs.join('\\n');
-        const el = document.getElementById('logs');
-        el.scrollTop = el.scrollHeight;
-      }
-      if (sj.ok) {
-        document.getElementById('status').innerText = sj.status;
-        if (sj.saved_count !== undefined) {
-          document.getElementById('savedCount').innerText = 'Saved: ' + sj.saved_count;
-        }
-        const links = document.getElementById('jobLinks');
-        links.innerHTML = '';
-        if (sj.status === 'done') {
-          links.innerHTML = `<a href="/download/${jobid}" target="_blank" style="color:#99f">Download ZIP</a>`;
-          const ss = document.getElementById('screenshotArea');
-          ss.innerHTML = `<img src="/screenshot/${jobid}" class="screenshot" alt="screenshot">`;
-        } else if (sj.status === 'error') {
-          links.innerText = 'error';
-        }
-      }
-    } catch (e) {
-      console.error(e);
-    }
-  }, 1200);
-}
+document.getElementById('capture_selected').onclick = async () => {
+  if (!jobid) { alert('No job'); return; }
+  const checks = Array.from(document.querySelectorAll('#endpoints input[type=checkbox]:checked'));
+  if (!checks.length) { alert('Select endpoints'); return; }
+  const endpoints = checks.map(c => decodeURIComponent(c.getAttribute('data-url')));
+  const res = await fetch('/capture_endpoints/'+jobid, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({endpoints})});
+  const j = await res.json(); if (!j.ok) alert('Failed: '+(j.error||'unknown')); else alert('Capture started. See logs.');
+};
+
+document.getElementById('capture_all').onclick = async () => {
+  if (!jobid) { alert('No job'); return; }
+  const res = await fetch('/capture_endpoints/'+jobid, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({endpoints: null})});
+  const j = await res.json(); if (!j.ok) alert('Failed: '+(j.error||'unknown')); else alert('Capture started. See logs.');
+};
 </script>
 </body>
 </html>
 """
 
-# API routes
 @app.route('/')
 def index():
     return render_template_string(INDEX_HTML)
@@ -722,24 +775,31 @@ def start():
         'id': jobid,
         'url': url,
         'status': 'queued',
-        'logs': [f"Queued job {jobid} for {url}"],
+        'logs': [f"Queued {jobid} for {url}"],
         'tmpdir': None,
         'screenshot': None,
         'zip_bytes': None,
         'saved_count': 0,
         'started_at': None,
         'finished_at': None,
-        # options
-        'advanced': bool(data.get('advanced', False)),
-        'max_pages': int(data.get('max_pages', 50) or 50),
+        'advanced': bool(data.get('advanced', True)),
+        'obey_robots': bool(data.get('obey_robots', False)),
+        'concurrency': int(data.get('concurrency', 1) or 1),
+        'crawl_mode': data.get('crawl_mode', 'bfs'),
+        'depth_limit': int(data.get('depth_limit', 0) or 0),
+        'no_page_limit': bool(data.get('no_page_limit', True)),
+        'max_pages': int(data.get('max_pages', 100) or 100),
         'snapshots': int(data.get('snapshots', 1) or 1),
         'same_host_only': bool(data.get('same_host_only', True)),
-        'follow_buttons': bool(data.get('follow_buttons', False)),
+        'follow_buttons': bool(data.get('follow_buttons', True)),
+        'capture_api': bool(data.get('capture_api', True)),
+        'auto_snapshot': bool(data.get('auto_snapshot', True)),
         'per_page_timeout': int(data.get('per_page_timeout', 30) or 30),
+        'max_runtime': int(data.get('max_runtime', 0) or 0),
+        'max_resources': int(data.get('max_resources', 0) or 0),
     }
     with JOBS_LOCK:
         JOBS[jobid] = job
-
     t = threading.Thread(target=lambda: run_mirror_job(jobid, url), daemon=True)
     t.start()
     return jsonify({'ok': True, 'jobid': jobid})
@@ -758,11 +818,82 @@ def status(jobid):
         job = JOBS.get(jobid)
         if not job:
             return jsonify({'ok': False, 'error': 'job not found'}), 404
-        return jsonify({
-            'ok': True,
-            'status': job.get('status'),
-            'saved_count': job.get('saved_count', 0),
-        })
+        return jsonify({'ok': True, 'status': job.get('status')})
+
+@app.route('/endpoints/<jobid>')
+def endpoints(jobid):
+    with JOBS_LOCK:
+        job = JOBS.get(jobid)
+        if not job:
+            return jsonify({'ok': False, 'error': 'job not found'}), 404
+        eps = sorted(list(job.get('endpoints') or []))
+        return jsonify({'ok': True, 'endpoints': eps})
+
+@app.route('/capture_endpoints/<jobid>', methods=['POST'])
+def capture_endpoints(jobid):
+    data = request.get_json(silent=True) or {}
+    endpoints = data.get('endpoints')
+    with JOBS_LOCK:
+        job = JOBS.get(jobid)
+        if not job:
+            return jsonify({'ok': False, 'error': 'job not found'}), 404
+        eps = sorted(list(job.get('endpoints') or []))
+    if endpoints is None:
+        to_capture = eps
+    else:
+        to_capture = endpoints
+    if not to_capture:
+        return jsonify({'ok': True, 'message': 'no endpoints to capture'})
+
+    def do_capture():
+        with JOBS_LOCK:
+            job['logs'].append(f"Starting capture of {len(to_capture)} endpoints")
+        try:
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-dev-shm-usage'])
+                context = browser.new_context(ignore_https_errors=True)
+                for ep in to_capture:
+                    try:
+                        if job.get('same_host_only') and not same_host(job.get('url'), ep):
+                            with JOBS_LOCK:
+                                job['logs'].append(f"Skipping endpoint (different host): {ep}")
+                            continue
+                        resp = context.request.get(ep, timeout=job.get('per_page_timeout',30)*1000)
+                        content = resp.body()
+                        if not content:
+                            with JOBS_LOCK:
+                                job['logs'].append(f"Endpoint empty: {ep} (status {resp.status})")
+                            continue
+                        api_folder = os.path.join(job.get('tmpdir'), f"snapshot_0", "api_responses")
+                        ensure_parent(os.path.join(api_folder, 'placeholder.txt'))
+                        ct = resp.headers.get('content-type', '')
+                        ext = ext_from_content_type(ct) or '.bin'
+                        h = hashlib.sha1(ep.encode('utf-8')).hexdigest()[:12]
+                        fname = f"{h}_{resp.status}{ext}"
+                        local = os.path.join(api_folder, fname)
+                        with open(local, 'wb') as fh:
+                            fh.write(content)
+                        rel = os.path.relpath(local, job.get('tmpdir')).replace(os.sep, '/')
+                        with JOBS_LOCK:
+                            job.setdefault('url_to_local', {})[ep] = rel
+                            job['logs'].append(f"Captured endpoint: {ep} -> {rel}")
+                            job['saved_count'] = job.get('saved_count',0) + 1
+                    except Exception as e:
+                        with JOBS_LOCK:
+                            job['logs'].append(f"Failed capture {ep}: {e}")
+                try:
+                    context.close()
+                except Exception:
+                    pass
+                try:
+                    browser.close()
+                except Exception:
+                    pass
+        except Exception as e:
+            with JOBS_LOCK:
+                job['logs'].append("Error capturing endpoints: " + str(e))
+    threading.Thread(target=do_capture, daemon=True).start()
+    return jsonify({'ok': True})
 
 @app.route('/screenshot/<jobid>')
 def screenshot(jobid):
@@ -784,24 +915,15 @@ def download(jobid):
         if job.get('status') != 'done' or not job.get('zip_bytes'):
             abort(404)
         data = job['zip_bytes']
-    return send_file(
-        io.BytesIO(data),
-        mimetype='application/zip',
-        as_attachment=True,
-        download_name=f'ghost_clone_{jobid}.zip'
-    )
+    return send_file(io.BytesIO(data), mimetype='application/zip', as_attachment=True, download_name=f'ghost_clone_{jobid}.zip')
 
-# Run server
 if __name__ == '__main__':
-    # Attempt to install browsers at startup (best to have done this during build)
     try:
         ok, msg = ensure_playwright_browsers()
         if not ok:
             print("Playwright/browsers not ready:", msg, file=sys.stderr)
-            print("You can run: python -m playwright install chromium", file=sys.stderr)
+            print("Run: python -m playwright install chromium", file=sys.stderr)
     except Exception as e:
-        print("Playwright install check failed:", e, file=sys.stderr)
-
+        print("Playwright check failed:", e, file=sys.stderr)
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=False)
-# (End of file)
